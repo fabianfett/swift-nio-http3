@@ -14,34 +14,34 @@
 
 import NIOCore
 @_spi(PackageInternal) import QPACK
+import NIOQUICHelpers
 
 /// Read encoder instructions from a channel and give them to a callback.
 /// This belongs on the incoming encoder stream.
 /// The encoder instructions come from the remote encoder and should be fed into the local decoder.
-final class QPACKInboundEncoderStreamHandler: ChannelInboundHandler {
-    typealias InboundIn = QPACKEncoderInstruction
+final class QPACKInboundEncoderStreamHandler<QUICStreamCreator: NIOQUICHelpers.QUICStreamCreator>: ChannelInboundHandler {
+    typealias InboundIn = ByteBuffer
 
-    /// Called when an incoming instruction is successfully read.
-    private var onReceivedInstruction: (QPACKEncoderInstruction) -> Void
-    /// Called when an error is caught on this channel.
-    private var onError: (any Error) -> Void
+    private let qpackCoder: NIOQPACKCoder<QUICStreamCreator>
+    private var decoder: NIOSingleStepByteToMessageProcessor<QPACKEncoderInstructionDecoder>
 
-    init(
-        onReceivedInstruction: @escaping (QPACKEncoderInstruction) -> Void,
-        onError: @escaping (any Error) -> Void
-    ) {
-        self.onReceivedInstruction = onReceivedInstruction
-        self.onError = onError
+    init(qpackCoder: NIOQPACKCoder<QUICStreamCreator>) {
+        self.qpackCoder = qpackCoder
     }
 
     func errorCaught(context: ChannelHandlerContext, error: any Error) {
-        self.onError(error)
+        self.qpackCoder.incomingEncoderInstructionStreamFailed(error)
         context.fireErrorCaught(error)
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        let instruction = unwrapInboundIn(data)
-        self.onReceivedInstruction(instruction)
-        context.fireChannelRead(data)
+        var byteBuffer = self.unwrapInboundIn(data)
+        do {
+            try self.decoder.process(buffer: byteBuffer) { instruction in
+                self.qpackCoder.receivedIncomingEncoderInstruction(instruction)
+            }
+        } catch {
+            self.qpackCoder.incomingEncoderInstructionStreamFailed(error)
+        }
     }
 }

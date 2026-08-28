@@ -18,13 +18,13 @@ protocol _HTTPField {
 
 @_spi(PackageInternal)
 public protocol QPACKOutboundEncoderStream: ~Copyable {
-    func sendInstructions(_ instructions: some Collection<QPACKEncoderInstruction>)
+    mutating func sendInstructions(_ instructions: some Collection<QPACKEncoderInstruction>)
 }
 
 @_spi(PackageInternal)
 public protocol QPACKOutboundDecoderStream: ~Copyable {
-    func sendInstruction(_ instruction: QPACKDecoderInstruction)
-    func sendInstructions(_ instruction: some Collection<QPACKDecoderInstruction>)
+    mutating func sendInstruction(_ instruction: QPACKDecoderInstruction)
+    mutating func sendInstructions(_ instruction: some Collection<QPACKDecoderInstruction>)
 }
 
 @_spi(PackageInternal)
@@ -35,13 +35,23 @@ public protocol ConnectionDelegate {
 
 @_spi(PackageInternal)
 public protocol QPACKDecodeReceiver {
-    func decodeResult(_ result: Result<[HTTPField], any Error>)
+    func decodeResult(_ result: Result<[HTTPField], HTTP3Error>)
+}
+
+public protocol OutboundHTTPFields {
+
+}
+
+public protocol InboundHTTPFields {
+
 }
 
 @_spi(PackageInternal)
 public final class QPACKCoder<
     OutboundEncoderStream: QPACKOutboundEncoderStream & ~Copyable,
     OutboundDecoderStream: QPACKOutboundDecoderStream & ~Copyable,
+//    OutboundHTTPFields: HTTP3.OutboundHTTPFields,
+//    InboundHTTPFields: HTTP3.InboundHTTPFields,
     ConnectionDelegate: HTTP3.ConnectionDelegate,
     DecodeReceiver: QPACKDecodeReceiver
 > {
@@ -54,7 +64,8 @@ public final class QPACKCoder<
 
     private let connection: ConnectionDelegate
 
-    init(
+    @_spi(PackageInternal)
+    public init(
         decoderMaxTableSize: Int,
         decoderMaxBlockedStreams: Int,
         errorDelegate: ConnectionDelegate
@@ -120,6 +131,11 @@ public final class QPACKCoder<
         }
     }
 
+    @_spi(PackageInternal)
+    public func incomingDecoderInstructionStreamFailed(_ error: HTTP3Error) {
+        self.connection.connectionError(error)
+    }
+
     // MARK: Decode
 
     /// Tell the connection coordinator that we want to decode a header. It will handle queueing and call back into us when it has a result.
@@ -179,6 +195,13 @@ public final class QPACKCoder<
             break
         }
     }
+
+    @_spi(PackageInternal)
+    public func incomingEncoderInstructionStreamFailed(_ error: HTTP3Error) {
+        self.connection.connectionError(error)
+    }
+
+    // MARK: Stream Management
 
     @_spi(PackageInternal)
     public func requestStreamClosed(streamID: QUICStreamID, seenEOF: Bool) {

@@ -21,13 +21,6 @@ import NIOQUICHelpers
 /// This is an internal protocol that shall only be implemented by HTTP3ConnectionCoordinator
 /// It exists to enable testing of `HTTP3StreamHandler` in isolation.
 protocol HTTP3StreamDelegate {
-    /// Ask the connection coordinator to encode some fields into a partial header.
-    /// It will handle sending any necessary instructions to the remote, on the dedicated QPACK stream.
-    func encodeHeaders(_: [HTTPField], forStream streamID: QUICStreamID) -> HTTP3PartialFrame.Headers
-
-    /// Tell the connection coordinator that we want to decode a header. It will handle queueing and call back into us when it has a result.
-    func decodeHeaders(_: HTTP3PartialFrame.Headers, forStream streamID: QUICStreamID)
-
     /// Tell the connection state when this stream becomes inactive.
     ///
     /// - Parameters:
@@ -40,10 +33,21 @@ protocol HTTP3StreamDelegate {
     func onConnectionError(_ error: HTTP3Error)
 }
 
+protocol QPACKCoder {
+    associatedtype Receiver: HTTP3.QPACKDecodeReceiver
+
+    /// Ask the connection coordinator to encode some fields into a partial header.
+    /// It will handle sending any necessary instructions to the remote, on the dedicated QPACK stream.
+    func encodeHeaders(_: [HTTPField], forStream streamID: QUICStreamID) -> HTTP3PartialFrame.Headers
+
+    /// Tell the connection coordinator that we want to decode a header. It will handle queueing and call back into us when it has a result.
+    func decodeHeaders(_ headers: HTTP3PartialFrame.Headers, forStream streamID: QUICStreamID, decodeReceiver: Receiver)
+}
+
 /// This handler should be added to every incoming and outgoing HTTP/3 stream which carries HTTP frames.
 /// It handles encoding and decoding of these frames.
 /// It will only pass through valid frames, and handles things such as QPACK header decoding.
-final class HTTP3StreamHandler<Delegate: HTTP3StreamDelegate>: ChannelDuplexHandler {
+final class HTTP3StreamHandler<QPACKCoder: NIOHTTP3.QPACKCoder, Delegate: HTTP3StreamDelegate>: ChannelDuplexHandler where QPACKCoder.Receiver == HTTP3StreamHandler<QPACKCoder, Delegate> {
     typealias InboundIn = ByteBuffer
     typealias InboundOut = HTTP3Frame
 
@@ -54,6 +58,7 @@ final class HTTP3StreamHandler<Delegate: HTTP3StreamDelegate>: ChannelDuplexHand
     private let streamType: HTTP3StreamType.Framed
 
     private let delegate: Delegate
+    private let qpackCoder: QPACKCoder
 
     /// The channel context. This handler can only be in one channel at a time.
     private var context: ChannelHandlerContext?
@@ -217,7 +222,7 @@ final class HTTP3StreamHandler<Delegate: HTTP3StreamDelegate>: ChannelDuplexHand
                 didFireChannelRead = true
             case .decodeHeader(let partialHeader):
                 self.logger.trace("HTTP3StreamHandler waiting for QPACK decode")
-                self.delegate.decodeHeaders(partialHeader, forStream: self.streamID)
+                self.qpackCoder.decodeHeaders(partialHeader, forStream: self.streamID)
             case .emitStreamError(let error):
                 context.triggerUserOutboundEvent(
                     QUICStopSendingEvent(code: QUICApplicationErrorCode(error.h3ErrorCode ?? .noError)),
@@ -354,7 +359,7 @@ final class HTTP3StreamHandler<Delegate: HTTP3StreamDelegate>: ChannelDuplexHand
     }
 
     /// Call this when `header` has been decoded.
-    func onQPACKDecodeResult(fields: [HTTPField], forHeaders headers: HTTP3PartialFrame.Headers) {
+    func onQPACKDecodeResult(fields: [HTTPField]) {
         self.logger.trace("HTTP3StreamHandler.onQPACKDecodeResult")
         guard let context = self.context else {
             // The stream must have been created and registered to get QPACK events and thus already have
@@ -362,20 +367,20 @@ final class HTTP3StreamHandler<Delegate: HTTP3StreamDelegate>: ChannelDuplexHand
             // still be open and active.
             fatalError("Tried to deliver QPACK results before handler was added")
         }
-        self.stateMachine.gotHeaderDecodeResult(fields, from: headers)
+        self.stateMachine.gotHeaderDecodeResult(fields)
         // Call self.channelReadComplete which will decode and fire reads as much as possible before firing a read complete
         self.channelReadComplete(context: context)
     }
 
     /// Call this if an error is encountered whilst trying to decode `header`.
-    func onQPACKDecodeError(_ error: HTTP3Error, forHeaders headers: HTTP3PartialFrame.Headers) {
+    func onQPACKDecodeError(_ error: HTTP3Error) {
         guard let context = self.context else {
             // The stream must have been created an registered to get QPACK events and thus already have
             // the context available. Since pending decodes are dropped when the stream closes it must
             // still be open and active.
             fatalError("Tried to deliver QPACK error before handler was set")
         }
-        self.stateMachine.gotHeaderDecodeError(error, from: headers)
+        self.stateMachine.gotHeaderDecodeError(error)
         // Call self.channelReadComplete which will decode and fire reads as much as possible before firing a read complete
         self.channelReadComplete(context: context)
     }
@@ -475,3 +480,14 @@ final class HTTP3StreamHandler<Delegate: HTTP3StreamDelegate>: ChannelDuplexHand
 
 @available(*, unavailable)
 extension HTTP3StreamHandler: Sendable {}
+
+extension HTTP3StreamHandler: QPACKDecodeReceiver {
+    func decodeResult(_ result: Result<[HTTPTypes.HTTPField], HTTP3Error>) {
+        switch result {
+        case .success(let fields):
+            self.onQPACKDecodeResult(fields: fields)
+        case .failure(let error):
+            self.onQPACKDecodeError(error)
+        }
+    }
+}
