@@ -312,6 +312,63 @@ struct NIOHTTP3StreamHandlerTests {
         #expect(seenEvents.isEmpty())
     }
 
+    /// While a QPACK decode is outstanding, nothing may overtake it: the frame the decoder had already
+    /// produced is held, the bytes behind it stay undecoded, and everything comes out in order once the
+    /// decode result arrives.
+    @Test
+    func pausesDecodingWhileHeaderDecodeIsOutstanding() throws {
+        let eventLoop = EmbeddedEventLoop()
+        let handler = HTTP3StreamHandler(
+            stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
+            streamID: 5,
+            streamType: .request,
+            qpackCoder: Self.makeQPACKCoder(),
+            delegate: TestDelegate(onStreamClosed: { _, _, _ in }),
+            logger: self.logger
+        )
+        let seenEvents = NIOLockedValueBox<Deque<DebugInboundEventsHandler.Event>>([])
+        let eventRecorder = DebugInboundEventsHandler { event, _ in
+            seenEvents.withLockedValue { $0.append(event) }
+        }
+        let channel = EmbeddedChannel(handlers: [handler, eventRecorder], loop: eventLoop)
+        #expect(seenEvents.popFirst()?.isChannelRegistered == true)
+
+        // A head whose QPACK decode can't complete: it references a dynamic table entry we never send.
+        channel.pipeline.fireChannelRead(self.blockedRequestPartialHeaderBytes)
+        #expect(seenEvents.isEmpty())
+
+        // More frames arrive while that decode is outstanding. The body is decoded and then held, and the
+        // trailers behind it are never even decoded: the processor still has those bytes.
+        let trailerFields: [HTTPField] = [.init(name: .init("trailer-field")!, value: "value")]
+        var moreBytes = ByteBuffer()
+        moreBytes.writeHTTP3PartialFrame(.data(.init(string: "hello world")), preferHuffmanEncoding: false)
+        moreBytes.writeHTTP3PartialFrame(
+            .headers(.init(fieldSection: StaticQPACKEncoder().encode(headers: trailerFields))),
+            preferHuffmanEncoding: false
+        )
+        channel.pipeline.fireChannelRead(moreBytes)
+        channel.pipeline.fireChannelReadComplete()
+
+        // Nothing at all has gone downstream: not even a read complete, because nothing was read.
+        #expect(seenEvents.isEmpty())
+
+        // The decode lands. Now the head, then everything queued behind it, in the order it arrived.
+        handler.onQPACKDecodeResult(fields: self.testRequestHeaderFields)
+
+        let headRead = try #require(seenEvents.popFirst()?.readValue)
+        #expect(handler.unwrapOutboundIn(headRead) == self.testRequestHeaderFrame)
+
+        let dataRead = try #require(seenEvents.popFirst()?.readValue)
+        #expect(handler.unwrapOutboundIn(dataRead) == .data(.init(string: "hello world")))
+
+        let trailerRead = try #require(seenEvents.popFirst()?.readValue)
+        #expect(handler.unwrapOutboundIn(trailerRead) == .headers(trailerFields))
+
+        // One read complete covers the frames the decode released.
+        #expect(seenEvents.popFirst()?.isChannelReadComplete == true)
+        #expect(seenEvents.isEmpty())
+    }
+
     /// A read burst containing several frames must produce exactly one `channelReadComplete`, even
     /// though the QPACK decodes in it complete synchronously and re-enter `channelReadComplete`.
     @Test
