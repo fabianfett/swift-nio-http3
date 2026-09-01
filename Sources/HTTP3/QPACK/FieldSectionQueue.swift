@@ -21,10 +21,10 @@ enum FieldSectionQueueError: Error, Hashable, Sendable {
 }
 
 /// A queue of FieldSections which cannot yet be decoded.
-struct FieldSectionQueue {
+struct FieldSectionQueue<Context> {
     /// An entry in the queue.
     /// `Comparable` and `Equatable` are implemented based on the ``FieldSectionPrefix/requiredInsertCount`` only.
-    struct Entry: Sendable, Comparable {
+    struct Entry: Comparable {
         /// The original full headers.
         var headers: HTTP3PartialFrame.Headers
         /// The prefix of the message to be decoded.
@@ -34,16 +34,20 @@ struct FieldSectionQueue {
         /// The id of the stream we received this message on.
         var streamID: QUICStreamID
 
+        var context: Context
+
         init(
             headers: HTTP3PartialFrame.Headers,
             prefix: FieldSectionPrefix,
             lines: [FieldLine],
-            streamID: QUICStreamID
+            streamID: QUICStreamID,
+            context: Context
         ) {
             self.headers = headers
             self.prefix = prefix
             self.lines = lines
             self.streamID = streamID
+            self.context = context
         }
 
         static func < (lhs: Entry, rhs: Entry) -> Bool {
@@ -90,6 +94,11 @@ struct FieldSectionQueue {
         // Fairly expensive operation, but only called when a stream closes uncleanly, which should be rare.
         // Also, this heap should never be very big anyway, at most equal to the number of open streams.
         self.entries = .init(self.entries.unordered.filter { $0.streamID != streamID })
+    }
+
+    /// Remove every entry in the queue.
+    mutating func removeAll() {
+        self.entries = .init()
     }
 
     /// - Parameter maxItems: The maximum number of items that may be in the queue at any one time.

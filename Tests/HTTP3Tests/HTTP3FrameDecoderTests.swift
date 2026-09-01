@@ -12,13 +12,82 @@
 //
 //===----------------------------------------------------------------------===//
 
+import DequeModule
 import NIOCore
 @_spi(PackageInternal) import QPACK
 import Testing
 
 @testable @_spi(PackageInternal) import HTTP3
 
-struct HTTP3FrameDecoderStateMachineTests {
+/// Drives ``HTTP3FrameDecoder`` through a ``NIOSingleStepByteToMessageProcessor``, the way
+/// ``HTTP3StreamHandler`` does, while keeping the one-frame-at-a-time shape these tests are written
+/// against.
+///
+/// The queue of decoded frames is a convenience for the tests only. The handler never holds more than a
+/// single frame, because it stops the processor as soon as it can't take another.
+private struct FrameDecoderDriver {
+    enum DecodeAction {
+        case returnFrame(HTTP3PartialFrame)
+        case returnUnknownFrame
+        /// The input ended part way through a frame.
+        case truncated
+        case needMoreBytes
+        case emitConnectionError(HTTP3Error)
+        case previousError
+    }
+
+    private let processor = NIOSingleStepByteToMessageProcessor(HTTP3FrameDecoder())
+    private var decoded = Deque<HTTP3DecodedFrame>()
+    /// An error to report on the next `decodeNext()`.
+    private var errorToReport: HTTP3Error?
+    /// Whether an error has already been reported. Nothing is decoded after that.
+    private var seenError = false
+
+    /// Feed bytes in, decoding as much as possible.
+    mutating func buffer(_ buffer: ByteBuffer) {
+        let processor = self.processor
+        self.run { try processor.process(buffer: buffer, $0) }
+    }
+
+    /// Tell the decoder no more bytes are coming.
+    mutating func inputClosed(seenEOF: Bool = true) {
+        let processor = self.processor
+        self.run { try processor.finishProcessing(seenEOF: seenEOF, $0) }
+    }
+
+    private mutating func run(_ body: ((HTTP3DecodedFrame) throws -> Void) throws -> Void) {
+        // A real pipeline stops feeding the decoder once it has failed the connection.
+        guard !self.seenError else { return }
+        var decoded = self.decoded
+        do {
+            try body { decoded.append($0) }
+        } catch let error as HTTP3Error {
+            self.seenError = true
+            self.errorToReport = error
+        } catch {
+            Issue.record("Unexpected error \(error)")
+        }
+        self.decoded = decoded
+    }
+
+    /// Take the next thing the decoder produced.
+    mutating func decodeNext() -> DecodeAction {
+        if let frame = self.decoded.popFirst() {
+            switch frame {
+            case .known(let frame): return .returnFrame(frame)
+            case .unknown: return .returnUnknownFrame
+            case .truncated: return .truncated
+            }
+        }
+        if let error = self.errorToReport {
+            self.errorToReport = nil
+            return .emitConnectionError(error)
+        }
+        return self.seenError ? .previousError : .needMoreBytes
+    }
+}
+
+struct HTTP3FrameDecoderTests {
     private let testDataFrameContent: [UInt8] = [1, 2, 3, 4]
     // Type is 0, length is 4, data is 1,2,3,4
     private let testDataFrameBytes: [UInt8] = [0, 4, 1, 2, 3, 4]
@@ -43,7 +112,7 @@ struct HTTP3FrameDecoderStateMachineTests {
 
     @Test
     func testFullFrame() {
-        var decoder = HTTP3FrameDecoderStateMachine()
+        var decoder = FrameDecoderDriver()
         // send in a full data frame
         decoder.buffer(.init(bytes: self.testDataFrameBytes))
         let action = decoder.decodeNext()
@@ -58,7 +127,7 @@ struct HTTP3FrameDecoderStateMachineTests {
         #expect(encodedFrame.readableBytes == 6)
         let bytes = [UInt8](buffer: encodedFrame)
         // drip in a frame, byte by byte, except for the last one
-        var decoder = HTTP3FrameDecoderStateMachine()
+        var decoder = FrameDecoderDriver()
         for byte in bytes.dropLast() {
             decoder.buffer(.init(bytes: [byte]))
             #expect(decoder.decodeNext().needsMoreBytes)
@@ -71,7 +140,7 @@ struct HTTP3FrameDecoderStateMachineTests {
 
     @Test
     func testPartialDataFrame() {
-        var decoder = HTTP3FrameDecoderStateMachine()
+        var decoder = FrameDecoderDriver()
 
         decoder.buffer(.init(bytes: [0]))  // frame type data
         #expect(decoder.decodeNext().needsMoreBytes)  // Nothing useful can come yet
@@ -95,7 +164,7 @@ struct HTTP3FrameDecoderStateMachineTests {
     @Test
     func testUnknownFrameType() {
         let bytes: [UInt8] = [12, 0]  // 12 is not a known type
-        var decoder = HTTP3FrameDecoderStateMachine()
+        var decoder = FrameDecoderDriver()
         decoder.buffer(.init(bytes: bytes))
 
         // There is no action, unknown frames are dropped
@@ -107,12 +176,36 @@ struct HTTP3FrameDecoderStateMachineTests {
         #expect(action3.returnFrame == .data(.init(bytes: self.testDataFrameContent)))
     }
 
+    /// An unknown frame whose payload doesn't all arrive at once must not spin: the decoder skips what it
+    /// has and asks for more, rather than looping on an empty buffer.
+    @Test
+    func testUnknownFrameTypeWithSplitPayload() {
+        // Type 12 is not a known type, and it declares a four byte payload.
+        var decoder = FrameDecoderDriver()
+        decoder.buffer(.init(bytes: [12, 4] as [UInt8]))
+
+        #expect(decoder.decodeNext().isReturnUnknownFrame)
+        // The payload hasn't arrived, so there is nothing more to do yet.
+        #expect(decoder.decodeNext().needsMoreBytes)
+
+        // The payload arrives split in two, and neither half is enough to finish the skip.
+        decoder.buffer(.init(bytes: [0xde, 0xad] as [UInt8]))
+        #expect(decoder.decodeNext().needsMoreBytes)
+
+        decoder.buffer(.init(bytes: [0xbe, 0xef] as [UInt8]))
+        #expect(decoder.decodeNext().needsMoreBytes)
+
+        // Once the unknown frame has been skipped over, the frame behind it decodes as usual.
+        decoder.buffer(.init(bytes: self.testDataFrameBytes))
+        #expect(decoder.decodeNext().returnFrame == .data(.init(bytes: self.testDataFrameContent)))
+    }
+
     @Test
     func testForbiddenFrameType() {
         let forbiddenTypes: [UInt8] = [2, 6, 8, 9]
         for type in forbiddenTypes {
             let bytes: [UInt8] = [type]
-            var decoder = HTTP3FrameDecoderStateMachine()
+            var decoder = FrameDecoderDriver()
             decoder.buffer(.init(bytes: bytes))
 
             let action1 = decoder.decodeNext()
@@ -123,7 +216,7 @@ struct HTTP3FrameDecoderStateMachineTests {
                     expectedCode: .forbiddenFrameType,
                     expectedH3ErrorCode: .frameUnexpected
                 )
-            case .returnFrame, .needMoreBytes, .previousError, .returnUnknownFrame:
+            case .returnFrame, .needMoreBytes, .previousError, .returnUnknownFrame, .truncated:
                 Issue.record("Unexpected action")
             }
 
@@ -140,7 +233,7 @@ struct HTTP3FrameDecoderStateMachineTests {
 
     @Test
     func testPartialHeader() {
-        var decoder = HTTP3FrameDecoderStateMachine()
+        var decoder = FrameDecoderDriver()
         decoder.buffer(.init(bytes: self.testHeaderFrameBytes))
         let action1 = decoder.decodeNext()
         #expect(action1.returnFrame == .headers(self.testHeader))
@@ -148,30 +241,30 @@ struct HTTP3FrameDecoderStateMachineTests {
 
     @Test
     func testDecodeNoBytes() {
-        var decoder = HTTP3FrameDecoderStateMachine()
+        var decoder = FrameDecoderDriver()
         let action1 = decoder.decodeNext()
         #expect(action1.needsMoreBytes)
     }
 
     @Test
     func testInputCloseImmediately() {
-        let decoder = HTTP3FrameDecoderStateMachine()
-        let leftoverBytes = decoder.inputClosed()
-        // Expect no leftover bytes because the decoder has seen no incoming bytes at all
-        #expect(!leftoverBytes)
+        var decoder = FrameDecoderDriver()
+        decoder.inputClosed()
+        // Nothing was truncated, because the decoder has seen no incoming bytes at all
+        #expect(decoder.decodeNext().needsMoreBytes)
     }
 
     @Test
     func testInputCloseCleanly() {
-        var decoder = HTTP3FrameDecoderStateMachine()
+        var decoder = FrameDecoderDriver()
 
         decoder.buffer(.init(bytes: self.testDataFrameBytes))
         let action = decoder.decodeNext()
         #expect(action.returnFrame == .data(.init(bytes: self.testDataFrameContent)))
 
-        // Expect no leftover bytes because the decoder has only seen a full frame
-        let leftoverBytes = decoder.inputClosed()
-        #expect(!leftoverBytes)
+        // Nothing was truncated, because the decoder has only seen a full frame
+        decoder.inputClosed()
+        #expect(decoder.decodeNext().needsMoreBytes)
     }
 
     @Test(arguments: [
@@ -181,145 +274,52 @@ struct HTTP3FrameDecoderStateMachineTests {
         [0, 1, 1, 0, 1],  // A full frame, followed by a frame with missing payload
     ])
     func testInputCloseUnclean(testData: [UInt8]) {
-        var decoder = HTTP3FrameDecoderStateMachine()
+        var decoder = FrameDecoderDriver()
 
         decoder.buffer(.init(bytes: testData))
         while case .returnFrame = decoder.decodeNext() {
             // Not interested in what comes out. We just want to consume all the full frames
         }
 
-        // We expect there to be some leftover bytes
-        let leftoverBytes = decoder.inputClosed()
-        #expect(leftoverBytes)
-    }
-
-    @Test
-    func testByteReclaimAfterLargeFrame() {
-        // Buffer a data frame containing 2048 bytes of payload. The initial buffer capacity is 4096 bytes. After
-        // decoding, the `readerIndex` will be 2051 (1 byte frame type + 2 byte length + 2048 byte payload), which is
-        // over the 50% threshold, so reclamation should fire when calling `decodeNext()`.
-        var decoder = HTTP3FrameDecoderStateMachine()
-
-        let largePayload = ByteBuffer(repeating: 1, count: 2048)
-        var encoded = ByteBuffer()
-        encoded.writeHTTP3PartialFrame(.data(.init(payload: largePayload)), preferHuffmanEncoding: false)
-
-        decoder.buffer(encoded)
-        // When `buffer()` is called on an idle state machine, the provided ByteBuffer is used directly as the internal
-        // decoding buffer. So `encoded.capacity` is the capacity of the decoder's buffer.
-        #expect(decoder._testOnlyBufferCapacity == 4096)
-        #expect(decoder._testOnlyBufferWriterIndex == 2051)
-
-        // After buffering but before decoding, the `readerIndex` should be 0 (nothing has been read yet).
-        #expect(decoder._testOnlyBufferReaderIndex == 0)
-
-        let action = decoder.decodeNext()
-        #expect(action.returnFrame == .data(.init(payload: largePayload)))
-
-        // After decoding, reclamation should have been triggered (`readerIndex` was > 2048).
-        #expect(decoder._testOnlyBufferReaderIndex == 0)
-    }
-
-    @Test
-    func testByteReclaimAfterManySmallFrames() {
-        // Feed many small data frames. This will result in the buffer's capacity being 4096 bytes. Then decode all
-        // frames to make `readerIndex` cross the 2048 bytes threshold. Each frame is 6 bytes:
-        // - After decoding 341 frames: `readerIndex` = 2046 (< 2048, no reclamation).
-        // - After decoding the 342nd frame: `readerIndex` = 2052 (> 2048, reclamation should fire).
-        var decoder = HTTP3FrameDecoderStateMachine()
-
-        var allBytes = ByteBuffer()
-        for _ in 0..<342 {
-            allBytes.writeBytes(self.testDataFrameBytes)
-        }
-
-        decoder.buffer(allBytes)
-        #expect(decoder._testOnlyBufferReaderIndex == 0)
-        #expect(decoder._testOnlyBufferWriterIndex == 342 * self.testDataFrameBytes.count)
-        #expect(decoder._testOnlyBufferCapacity == 4096)
-
-        // Decode 341 frames: just below the threshold.
-        for _ in 0..<341 {
-            let action = decoder.decodeNext()
-            #expect(action.returnFrame == .data(.init(payload: ByteBuffer(bytes: self.testDataFrameContent))))
-        }
-        // `readerIndex` should be 341 * 6 = 2046. Reclamation shouldn't have fired yet.
-        #expect(decoder._testOnlyBufferReaderIndex == 2046)
-
-        // Decode one more frame to cross the 2048 bytes threshold. Reclamation should fire.
-        let action = decoder.decodeNext()
-        #expect(action.returnFrame == .data(.init(payload: ByteBuffer(bytes: self.testDataFrameContent))))
-        #expect(decoder._testOnlyBufferReaderIndex == 0)
-    }
-
-    @Test
-    func testByteReclaimWithPartiallyDecodedFrame() {
-        // Verify that reclamation preserves unread bytes when a partial frame remains in the buffer.
-        var decoder = HTTP3FrameDecoderStateMachine()
-
-        let largePayload = ByteBuffer(repeating: 1, count: 2048)
-        let settingsFrame = HTTP3PartialFrame.settings(.init(qpackMaximumTableCapacity: 512))
-
-        // Encode the settings frame and split it. The first byte goes into the initial buffer, and the remainder will
-        // be buffered later.
-        var settingsEncoded = ByteBuffer()
-        settingsEncoded.writeHTTP3PartialFrame(settingsFrame, preferHuffmanEncoding: false)
-        let settingsFirstByte = settingsEncoded.readSlice(length: 1)!
-        let settingsRemainder = settingsEncoded
-
-        var encoded = ByteBuffer()
-        encoded.writeHTTP3PartialFrame(.data(.init(payload: largePayload)), preferHuffmanEncoding: false)
-        // Write only the first byte of the settings frame.
-        encoded.writeImmutableBuffer(settingsFirstByte)
-
-        decoder.buffer(encoded)
-        #expect(decoder._testOnlyBufferCapacity == 4096)
-
-        let action1 = decoder.decodeNext()
-        #expect(action1.returnFrame == .data(.init(payload: largePayload)))
-
-        // After decoding the large frame, `readerIndex` should have moved to 2051 (> 2048), which should have then
-        // triggered reclamation. Now `readerIndex` should be 0.
-        #expect(decoder._testOnlyBufferReaderIndex == 0)
-        // Check that the partial byte is still buffered:
-        #expect(decoder._testOnlyBufferWriterIndex == 1)
-        #expect(decoder.decodeNext().needsMoreBytes == true)
-
-        // Buffer the rest of the settings frame.
-        decoder.buffer(settingsRemainder)
-
-        let action2 = decoder.decodeNext()
-        #expect(action2.returnFrame == settingsFrame)
-        #expect(decoder._testOnlyBufferReaderIndex == (1 + settingsRemainder.readableBytes))
+        // The stream stopped part way through a frame
+        decoder.inputClosed()
+        #expect(decoder.decodeNext().isTruncated)
     }
 }
 
-extension HTTP3FrameDecoderStateMachine.DecodeAction {
+extension FrameDecoderDriver.DecodeAction {
     fileprivate var returnFrame: HTTP3PartialFrame? {
         switch self {
         case .returnFrame(let f): return f
-        case .emitConnectionError, .previousError, .needMoreBytes, .returnUnknownFrame: return nil
+        case .emitConnectionError, .previousError, .needMoreBytes, .returnUnknownFrame, .truncated: return nil
         }
     }
 
     fileprivate var isReturnUnknownFrame: Bool {
         switch self {
         case .returnUnknownFrame: return true
-        case .returnFrame, .emitConnectionError, .previousError, .needMoreBytes: return false
+        case .returnFrame, .emitConnectionError, .previousError, .needMoreBytes, .truncated: return false
+        }
+    }
+
+    fileprivate var isTruncated: Bool {
+        switch self {
+        case .truncated: return true
+        case .returnFrame, .emitConnectionError, .previousError, .needMoreBytes, .returnUnknownFrame: return false
         }
     }
 
     fileprivate var needsMoreBytes: Bool {
         switch self {
         case .needMoreBytes: return true
-        case .emitConnectionError, .previousError, .returnFrame, .returnUnknownFrame: return false
+        case .emitConnectionError, .previousError, .returnFrame, .returnUnknownFrame, .truncated: return false
         }
     }
 
     fileprivate var previousError: Bool {
         switch self {
         case .previousError: return true
-        case .emitConnectionError, .needMoreBytes, .returnFrame, .returnUnknownFrame: return false
+        case .emitConnectionError, .needMoreBytes, .returnFrame, .returnUnknownFrame, .truncated: return false
         }
     }
 }

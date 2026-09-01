@@ -12,6 +12,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+import DequeModule
 import HTTPTypes
 import NIOCore
 import NIOQUICHelpers
@@ -19,6 +20,117 @@ import NIOQUICHelpers
 import Testing
 
 @_spi(PackageInternal) @testable import HTTP3
+
+/// Drives ``HTTP3StreamStateMachine`` the way ``HTTP3StreamHandler`` does: bytes go through a
+/// ``NIOSingleStepByteToMessageProcessor``, and the frames it produces are fed in one at a time.
+///
+/// Queuing the decoded frames is a convenience for these tests, which pull one action at a time. The
+/// handler holds at most one frame, because it stops the processor as soon as the state machine says it
+/// can't take another.
+struct StreamStateMachineDriver: ~Copyable {
+    private var stateMachine: HTTP3StreamStateMachine
+    private let processor = NIOSingleStepByteToMessageProcessor(HTTP3FrameDecoder())
+    private var decoded = Deque<HTTP3DecodedFrame>()
+    /// An error from the decoder, to report on the next `decodeNext()`.
+    private var decoderError: HTTP3Error?
+    /// Whether the peer has finished sending and we still owe the state machine the end of input.
+    private var pendingEndOfInput = false
+
+    init(streamType: HTTP3StreamType.Framed, incoming: Bool, preferHuffmanEncoding: Bool) {
+        self.stateMachine = HTTP3StreamStateMachine(
+            streamType: streamType,
+            incoming: incoming,
+            preferHuffmanEncoding: preferHuffmanEncoding
+        )
+    }
+
+    mutating func buffer(_ buffer: ByteBuffer) {
+        let processor = self.processor
+        self.decode { try processor.process(buffer: buffer, $0) }
+    }
+
+    mutating func inputClosed() {
+        self.stateMachine.inputClosed()
+        // Flushing the decoder is what turns a truncated final frame into a `truncated` frame.
+        let processor = self.processor
+        self.decode { try processor.finishProcessing(seenEOF: true, $0) }
+        self.pendingEndOfInput = true
+    }
+
+    private mutating func decode(_ body: ((HTTP3DecodedFrame) throws -> Void) throws -> Void) {
+        guard self.decoderError == nil else { return }
+        var decoded = self.decoded
+        do {
+            try body { decoded.append($0) }
+        } catch let error as HTTP3Error {
+            self.decoderError = error
+        } catch {
+            Issue.record("Unexpected error \(error)")
+        }
+        self.decoded = decoded
+    }
+
+    mutating func decodeNext() -> HTTP3StreamStateMachine.DecodeNextAction {
+        // Whatever the state machine is already holding comes first.
+        switch self.stateMachine.nextAction() {
+        case .needMoreBytes:
+            break  // Ready for the next frame.
+        case .needDecodeResult:
+            // Blocked on QPACK. Nothing can overtake it.
+            return .needMoreBytes
+        case let action:
+            return action
+        }
+
+        if let frame = self.decoded.popFirst() {
+            return self.stateMachine.frameDecoded(frame)
+        }
+        if let error = self.decoderError {
+            self.decoderError = nil
+            return self.stateMachine.decoderFailed(error)
+        }
+        if self.pendingEndOfInput {
+            self.pendingEndOfInput = false
+            return self.stateMachine.endOfInput()
+        }
+        return .needMoreBytes
+    }
+
+    // MARK: Straight pass-throughs
+
+    mutating func gotHeaderDecodeResult(_ decoded: [HTTPField]) {
+        self.stateMachine.gotHeaderDecodeResult(decoded)
+    }
+
+    mutating func gotHeaderDecodeError(_ error: HTTP3Error) {
+        self.stateMachine.gotHeaderDecodeError(error)
+    }
+
+    mutating func writeFrame(
+        frame: HTTP3Frame,
+        into buffer: inout ByteBuffer
+    ) -> HTTP3StreamStateMachine.WriteFrameAction {
+        self.stateMachine.writeFrame(frame: frame, into: &buffer)
+    }
+
+    mutating func gotHeaderEncodeResult(
+        _ result: HTTP3PartialFrame.Headers,
+        from fields: [HTTPField],
+        into buffer: inout ByteBuffer
+    ) -> HTTP3StreamStateMachine.HeaderEncodeResultAction {
+        self.stateMachine.gotHeaderEncodeResult(result, from: fields, into: &buffer)
+    }
+
+    mutating func closed() -> HTTP3StreamStateMachine.FinishedAction {
+        self.stateMachine.closed()
+    }
+
+    mutating func streamErrorCaught(
+        errorCode: QUICApplicationErrorCode
+    ) -> HTTP3StreamStateMachine.ErrorCaughtAction? {
+        self.stateMachine.streamErrorCaught(errorCode: errorCode)
+    }
+}
 
 struct HTTP3StreamStateMachineTests {
     private let testDataFrame = HTTP3Frame.data(.init(bytes: [1, 2, 3, 4]))
@@ -106,13 +218,13 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testNothing() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
         machine.assertNoNext()
     }
 
     @Test
     func testReadFrame() {
-        var machine = HTTP3StreamStateMachine(streamType: .control, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .control, incoming: true, preferHuffmanEncoding: false)
         machine.buffer(.init(bytes: self.testSettingsFrameBytes))
         machine.assertReturnFrame(expected: .settings(self.testSettings))
         machine.assertNoNext()
@@ -126,7 +238,7 @@ struct HTTP3StreamStateMachineTests {
             bytes: testUnknownFrameBytes + self.testRequestHeaderFrameBytes + self.testDataFrameBytes
         )
 
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
         machine.buffer(buffer)
         machine.assertCallAgain()
         machine.assertReceivedHeaders(decode: decode)
@@ -136,7 +248,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testQPACK() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
         machine.buffer(.init(bytes: self.testRequestHeaderFrameBytes))
         let action1 = machine.decodeNext()
         guard case .decodeHeader(let partialHeader) = action1 else {
@@ -149,7 +261,7 @@ struct HTTP3StreamStateMachineTests {
         #expect(partialHeader == self.testRequestHeader)
 
         let decodeResult = self.testRequestHeaderFields
-        machine.gotHeaderDecodeResult(decodeResult, from: partialHeader)
+        machine.gotHeaderDecodeResult(decodeResult)
         let action2 = machine.decodeNext()
         guard case .returnFrame(let frame) = action2 else {
             Issue.record("Unexpected action \(action2)")
@@ -161,7 +273,7 @@ struct HTTP3StreamStateMachineTests {
     @Test
     func testLotsOfQPACK() {
         let decode = self.testQpackDecoderClosure()
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
         machine.buffer(.init(bytes: self.testRequestHeaderFrameBytes))
         machine.buffer(.init(bytes: self.testTrailerFrameBytes))
 
@@ -172,7 +284,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testQPACKQueueing() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
 
         // Throw in one headers and 1 data
         machine.buffer(.init(bytes: self.testRequestHeaderFrameBytes))
@@ -195,7 +307,7 @@ struct HTTP3StreamStateMachineTests {
 
         // Put in the decode result
         let decodeResult = self.testRequestHeaderFields
-        machine.gotHeaderDecodeResult(decodeResult, from: partialHeader)
+        machine.gotHeaderDecodeResult(decodeResult)
 
         // We should also be able to read more bytes now, after putting in the header decode result, before fetching back the action
         machine.buffer(.init(bytes: self.testDataFrameBytes))
@@ -217,7 +329,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testQPACKError() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
         machine.buffer(.init(bytes: self.testRequestHeaderFrameBytes))
         // Machine should ask us to decode a header now
         let action1 = machine.decodeNext()
@@ -235,7 +347,7 @@ struct HTTP3StreamStateMachineTests {
             errorCode: .internalError,
             location: .here()
         )
-        machine.gotHeaderDecodeError(testError, from: partialHeader)
+        machine.gotHeaderDecodeError(testError)
 
         // Let's put in some more bytes. They should get ignored because they come after an error
         machine.buffer(.init(bytes: self.testDataFrameBytes))
@@ -260,7 +372,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testWriteAfterQPACKErrorBeforeRead() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
         machine.buffer(.init(bytes: self.testRequestHeaderFrameBytes))
         // Machine should ask us to decode a header now
         let action1 = machine.decodeNext()
@@ -278,7 +390,7 @@ struct HTTP3StreamStateMachineTests {
             errorCode: .internalError,
             location: .here()
         )
-        machine.gotHeaderDecodeError(testError, from: partialHeader)
+        machine.gotHeaderDecodeError(testError)
 
         // Writes are now dropped
         let writeAction = machine.writeFrame(frame: .headers(self.testResponseHeaderFields))
@@ -299,7 +411,7 @@ struct HTTP3StreamStateMachineTests {
     /// Read bytes which do not form a valid frame.
     @Test
     func testReadBadFrame() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
 
         let badBytes = ByteBuffer(bytes: [2])  // 2 is a forbidden frame frame type
         machine.buffer(badBytes)
@@ -321,7 +433,7 @@ struct HTTP3StreamStateMachineTests {
     /// We'll be sending a data frame when we need headers.
     @Test
     func testReadInvalidFrame() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
 
         let badBytes = ByteBuffer(bytes: self.testDataFrameBytes)
         machine.buffer(badBytes)
@@ -343,8 +455,8 @@ struct HTTP3StreamStateMachineTests {
     func testRoundtrip() throws {
         let decode = self.testQpackDecoderClosure()
 
-        var server = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
-        var client = HTTP3StreamStateMachine(streamType: .request, incoming: false, preferHuffmanEncoding: false)
+        var server = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var client = StreamStateMachineDriver(streamType: .request, incoming: false, preferHuffmanEncoding: false)
 
         // Client writes a head + data
         let clientWrite1 = client.writeFrameAndQPACK(frame: .headers(self.testRequestHeaderFields))
@@ -375,8 +487,8 @@ struct HTTP3StreamStateMachineTests {
     func testDoubleResponse() throws {
         let decode = self.testQpackDecoderClosure()
 
-        var server = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
-        var client = HTTP3StreamStateMachine(streamType: .request, incoming: false, preferHuffmanEncoding: false)
+        var server = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var client = StreamStateMachineDriver(streamType: .request, incoming: false, preferHuffmanEncoding: false)
 
         // Client writes a head + data
         let clientWrite1 = client.writeFrameAndQPACK(frame: .headers(self.testRequestHeaderFields))
@@ -410,7 +522,7 @@ struct HTTP3StreamStateMachineTests {
     func testWriteDuringIncomingData() {
         let decode = self.testQpackDecoderClosure()
 
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
 
         // Write request headers
         machine.buffer(.init(bytes: self.testRequestHeaderFrameBytes))
@@ -428,7 +540,7 @@ struct HTTP3StreamStateMachineTests {
     func testWriteDuringIncomingTrailers() {
         let decode = self.testQpackDecoderClosure()
 
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
 
         // Read request headers
         machine.buffer(.init(bytes: self.testRequestHeaderFrameBytes))
@@ -447,7 +559,7 @@ struct HTTP3StreamStateMachineTests {
 
         // Now decode the request trailers
         let testResult = self.testTrailerFields
-        machine.gotHeaderDecodeResult(testResult, from: self.testRequestHeader)
+        machine.gotHeaderDecodeResult(testResult)
 
         // The machine is now in a buffering state for reads, where it is holding on to that trailer for us. We can still write data out
         let writeAction2 = machine.writeFrameAndQPACK(frame: self.testDataFrame)
@@ -459,7 +571,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testWriteEncodeOutOfSequence() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: false, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: false, preferHuffmanEncoding: false)
 
         // Write request DATA (before headers). This is an error
         let action = machine.writeFrame(frame: .data(.init()))
@@ -479,7 +591,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testWriteDoubleData() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: false, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: false, preferHuffmanEncoding: false)
         let action1 = machine.writeFrameAndQPACK(frame: .headers(self.testRequestHeaderFields))
         action1?.assertReturnBytes(expectedBytes: .init(bytes: self.testRequestHeaderFrameBytes))
 
@@ -494,7 +606,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testInputClosedBeforeReceivingCompleteRequest() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
         machine.inputClosed()
         let action = machine.decodeNext()
         guard case .inputClosed(.resetStream(let error)) = action else {
@@ -511,7 +623,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testInputClosedBeforeReceivingCompleteResponse() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: false, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: false, preferHuffmanEncoding: false)
         machine.inputClosed()
         let action = machine.decodeNext()
 
@@ -525,7 +637,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testInputClosedAfterReceivingCompleteRequest() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
 
         machine.buffer(.init(bytes: self.testRequestHeaderFrameBytes))
 
@@ -535,7 +647,7 @@ struct HTTP3StreamStateMachineTests {
             return
         }
 
-        machine.gotHeaderDecodeResult(self.testRequestHeaderFields, from: headerToDecode)
+        machine.gotHeaderDecodeResult(self.testRequestHeaderFields)
         machine.inputClosed()
 
         machine.assertReturnFrame(expected: .headers(self.testRequestHeaderFields))
@@ -551,7 +663,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testInputClosedAfterReceivingCompleteResponse() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: false, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: false, preferHuffmanEncoding: false)
 
         // Before simulating receiving a response, we must send a request.
         _ = machine.writeFrame(frame: .headers(self.testRequestHeaderFields))
@@ -563,7 +675,7 @@ struct HTTP3StreamStateMachineTests {
             return
         }
 
-        machine.gotHeaderDecodeResult(self.testResponseHeaderFields, from: headerToDecode)
+        machine.gotHeaderDecodeResult(self.testResponseHeaderFields)
         machine.inputClosed()
 
         machine.assertReturnFrame(expected: .headers(self.testResponseHeaderFields))
@@ -579,7 +691,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testInputClosedCantOvertakeQueuedFrame() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
         machine.buffer(.init(bytes: self.testRequestHeaderFrameBytes))
         machine.inputClosed()
         let action1 = machine.decodeNext()
@@ -590,7 +702,7 @@ struct HTTP3StreamStateMachineTests {
 
         // There is no next, despite the input close, until we decode the header
         machine.assertNoNext()
-        machine.gotHeaderDecodeResult(self.testRequestHeaderFields, from: headerToDecode)
+        machine.gotHeaderDecodeResult(self.testRequestHeaderFields)
 
         // Now the headers are returned, then the input close, then nothing else
         machine.assertReturnFrame(expected: .headers(self.testRequestHeaderFields))
@@ -604,7 +716,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testInputClosedBeforeHeaderDecodeResult() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
         machine.buffer(.init(bytes: self.testRequestHeaderFrameBytes))
         let action1 = machine.decodeNext()
         guard case .decodeHeader(let headerToDecode) = action1 else {
@@ -615,7 +727,7 @@ struct HTTP3StreamStateMachineTests {
         // There is no next, despite the input close, until we decode the header
         machine.inputClosed()
         machine.assertNoNext()
-        machine.gotHeaderDecodeResult(self.testRequestHeaderFields, from: headerToDecode)
+        machine.gotHeaderDecodeResult(self.testRequestHeaderFields)
 
         // Now the headers are returned, then the input close, then nothing else
         machine.assertReturnFrame(expected: .headers(self.testRequestHeaderFields))
@@ -629,7 +741,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testInputClosedAfterHeaderDecodeResult() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
         machine.buffer(.init(bytes: self.testRequestHeaderFrameBytes))
         let action1 = machine.decodeNext()
         guard case .decodeHeader(let headerToDecode) = action1 else {
@@ -639,7 +751,7 @@ struct HTTP3StreamStateMachineTests {
 
         // There is no next until we decode the header
         machine.assertNoNext()
-        machine.gotHeaderDecodeResult(self.testRequestHeaderFields, from: headerToDecode)
+        machine.gotHeaderDecodeResult(self.testRequestHeaderFields)
 
         machine.inputClosed()
 
@@ -655,7 +767,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testInputClosedWithLeftoverBytes() {
-        var machine = HTTP3StreamStateMachine(streamType: .control, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .control, incoming: true, preferHuffmanEncoding: false)
         // A frame is formed of a type + length + payload
         // Here we only gave a type, so it's an unfinished frame
         machine.buffer(.init(bytes: [UInt8(HTTP3FrameType.settings.rawValue)]))
@@ -674,7 +786,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testStreamClosed() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
         let action = machine.closed()
         #expect(action == .streamClosed(seenEOF: false))
         machine.assertNoNext()
@@ -682,7 +794,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testStreamClosedAfterError() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
 
         let action1 = machine.streamErrorCaught(errorCode: QUICApplicationErrorCode(.messageError))
         #expect(action1 != nil)
@@ -693,7 +805,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testStreamClosedAfterBufferedEOF() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
         machine.inputClosed()
 
         let action = machine.closed()
@@ -704,7 +816,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testStreamClosedAfterEOF() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: true, preferHuffmanEncoding: false)
         machine.inputClosed()
 
         let action1 = machine.decodeNext()
@@ -719,7 +831,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testWriteFailsAfterStreamClosed() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: false, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: false, preferHuffmanEncoding: false)
         let action = machine.closed()
         #expect(action == .streamClosed(seenEOF: false))
 
@@ -732,7 +844,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testStreamClosedDuringQPACKEncode() {
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: false, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: false, preferHuffmanEncoding: false)
 
         let action1 = machine.writeFrame(frame: .headers(self.testRequestHeaderFields))
         guard case .encodeHeaders(let fieldsToEncode) = action1 else {
@@ -757,7 +869,7 @@ struct HTTP3StreamStateMachineTests {
     func testPushPromise() {
         // A push promise is normally valid on a request stream, but we don't allow it because we don't implement push
         // This means we never send a max push id, so it is a protocol error for the remote to send us a push promise
-        var machine = HTTP3StreamStateMachine(streamType: .request, incoming: false, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .request, incoming: false, preferHuffmanEncoding: false)
         // Before simulating receiving a response, we must send a request
         _ = machine.writeFrame(frame: .headers(self.testRequestHeaderFields))
 
@@ -782,7 +894,7 @@ struct HTTP3StreamStateMachineTests {
 
     @Test
     func testInputAfterInputClosed() {
-        var machine = HTTP3StreamStateMachine(streamType: .control, incoming: true, preferHuffmanEncoding: false)
+        var machine = StreamStateMachineDriver(streamType: .control, incoming: true, preferHuffmanEncoding: false)
         machine.inputClosed()
         let action1 = machine.decodeNext()
         guard case .inputClosed = action1 else {
@@ -794,7 +906,7 @@ struct HTTP3StreamStateMachineTests {
     }
 }
 
-extension HTTP3StreamStateMachine {
+extension StreamStateMachineDriver {
     fileprivate mutating func assertNoNext(sourceLocation: SourceLocation = #_sourceLocation) {
         let next = self.decodeNext()
         switch next {
@@ -833,7 +945,7 @@ extension HTTP3StreamStateMachine {
         case .missingInsertCount:
             Issue.record("Unexpected result", sourceLocation: sourceLocation)
         case .success(let fields, _):
-            self.gotHeaderDecodeResult(fields, from: partialHeader)
+            self.gotHeaderDecodeResult(fields)
             self.assertReturnFrame(expected: .headers(fields), sourceLocation: sourceLocation)
         case .error(let qpackError):
             let error = HTTP3Error(
@@ -843,7 +955,7 @@ extension HTTP3StreamStateMachine {
                 errorCode: .qpackDecompressionFailed,
                 location: .here()
             )
-            self.gotHeaderDecodeError(error, from: partialHeader)
+            self.gotHeaderDecodeError(error)
         }
     }
 
@@ -886,7 +998,7 @@ extension HTTP3StreamStateMachine {
     }
 }
 
-extension HTTP3StreamStateMachine.ResolvedAction {
+extension StreamStateMachineDriver.ResolvedAction {
     fileprivate func assertReturnBytes(expectedBytes: ByteBuffer, sourceLocation: SourceLocation = #_sourceLocation) {
         switch self {
         case .returnBytes(let bytes):
@@ -911,9 +1023,9 @@ extension HTTP3StreamStateMachine.WriteFrameAction {
     }
 }
 
-extension HTTP3StreamStateMachine {
+extension StreamStateMachineDriver {
     /// Test convenience: write a frame using a throwaway buffer, for assertions that don't inspect bytes.
-    fileprivate mutating func writeFrame(frame: HTTP3Frame) -> WriteFrameAction {
+    fileprivate mutating func writeFrame(frame: HTTP3Frame) -> HTTP3StreamStateMachine.WriteFrameAction {
         var buffer = ByteBuffer()
         return self.writeFrame(frame: frame, into: &buffer)
     }
@@ -922,7 +1034,7 @@ extension HTTP3StreamStateMachine {
     fileprivate mutating func gotHeaderEncodeResult(
         _ result: HTTP3PartialFrame.Headers,
         from: [HTTPField]
-    ) -> HeaderEncodeResultAction {
+    ) -> HTTP3StreamStateMachine.HeaderEncodeResultAction {
         var buffer = ByteBuffer()
         return self.gotHeaderEncodeResult(result, from: from, into: &buffer)
     }

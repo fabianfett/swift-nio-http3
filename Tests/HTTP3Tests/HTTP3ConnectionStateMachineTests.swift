@@ -363,27 +363,7 @@ struct HTTP3ConnectionStateMachineTests {
             Issue.record("Unexpected action \(String(describing: action2))")
             return
         }
-        #expect(!settings.makeEncoderInstructionStream)
         #expect(!settings.datagramsNegotiated)
-    }
-
-    @Test
-    func testGotSettingsWithQPACK() {
-        let localSettings = HTTP3Settings(qpackMaximumTableCapacity: 200)
-        let remoteSettings = HTTP3Settings(qpackMaximumTableCapacity: 100)
-        var stateMachine = HTTP3ConnectionStateMachine(settings: localSettings, type: .client)
-
-        let action1 = stateMachine.initialize()
-        #expect(action1 == .createControlAndDecoderStreams)
-
-        let action2 = stateMachine.receivedControlFrame(.settings(remoteSettings))
-        guard case .onSettings(let settings) = action2, settings.makeEncoderInstructionStream else {
-            Issue.record("Unexpected action \(String(describing: action2))")
-            return
-        }
-
-        let action3 = stateMachine.outboundEncoderStreamReady(streamID: 3)
-        #expect(action3 == .sendEncoderInstruction(.setDynamicTableCapacity(100)))
     }
 
     @Test
@@ -646,119 +626,6 @@ struct HTTP3ConnectionStateMachineTests {
             return
         }
         error.expect(code: .streamCreationError, h3ErrorCode: nil)
-    }
-
-    // MARK: QPACK
-
-    @Test
-    func testIncomingEncoderInstructionWithQueue() {
-        let testSettings = HTTP3Settings(qpackMaximumTableCapacity: 100)
-        var stateMachine = HTTP3ConnectionStateMachine(settings: testSettings, type: .client)
-
-        let action1 = stateMachine.initialize()
-        #expect(action1 == .createControlAndDecoderStreams)
-
-        let action2 = stateMachine.receivedIncomingEncoderInstruction(.setDynamicTableCapacity(100))
-        #expect(action2?.decoderInstructions == nil)
-
-        let action3 = stateMachine.receivedIncomingEncoderInstruction(
-            .insertWithLiteralName(name: "hello", value: "world")
-        )
-        // No action yet because the stream isn't ready
-        #expect(action3?.decoderInstructions == nil)
-
-        let action4 = stateMachine.outboundDecoderStreamReady(streamID: 2)
-        // Now the instructions come out
-        #expect(action4 == .sendDecoderInstructions([.insertCountIncrement(increment: 1)]))
-    }
-
-    @Test
-    func testIncomingEncoderInstructionNoQueue() {
-        let testSettings = HTTP3Settings(qpackMaximumTableCapacity: 100)
-        var stateMachine = HTTP3ConnectionStateMachine(settings: testSettings, type: .client)
-
-        let action1 = stateMachine.initialize()
-        #expect(action1 == .createControlAndDecoderStreams)
-
-        let action2 = stateMachine.outboundDecoderStreamReady(streamID: 3)
-        #expect(action2 == nil)
-
-        let action3 = stateMachine.receivedIncomingEncoderInstruction(.setDynamicTableCapacity(100))
-        #expect(action3?.decoderInstructions == nil)
-
-        let action4 = stateMachine.receivedIncomingEncoderInstruction(
-            .insertWithLiteralName(name: "hello", value: "world")
-        )
-        // The instructions come out immediately because the stream is already ready
-        #expect(action4?.decoderInstructions == .insertCountIncrement(increment: 1))
-    }
-
-    @Test
-    func testIncomingEncoderInstructionAfterShutdown() {
-        let testSettings: HTTP3Settings = .init(qpackMaximumTableCapacity: 100)
-        var stateMachine = HTTP3ConnectionStateMachine(settings: testSettings, type: .client)
-
-        let action1 = stateMachine.initialize()
-        #expect(action1 == .createControlAndDecoderStreams)
-
-        let action2 = stateMachine.outboundDecoderStreamReady(streamID: 3)
-        #expect(action2 == nil)
-
-        let action3 = stateMachine.receivedIncomingEncoderInstruction(.setDynamicTableCapacity(100))
-        #expect(action3?.decoderInstructions == nil)
-
-        #expect(stateMachine.shutdownConnectionImmediately() == .shutdown)
-
-        let action4 = stateMachine.receivedIncomingEncoderInstruction(
-            .insertWithLiteralName(name: "hello", value: "world")
-        )
-        #expect(action4 == nil)
-    }
-
-    @Test
-    func testIncomingDecoderInstruction() throws {
-        var idGenerator = IDGenerator(type: .server)
-        var stateMachine = HTTP3ConnectionStateMachine.makeInitializedWithQPACK(
-            type: .server,
-            idGenerator: &idGenerator
-        )
-
-        let action4 = stateMachine.inboundRequestStreamReceived(streamID: 0)
-        switch action4 {
-        case .emitConnectionError(let error), .emitStreamError(let error):
-            throw error
-        case .addHandlers:
-            // We need to send an encoder instruction before we can test decoder instructions
-            let action5 = stateMachine.encodeHeaders(
-                [.init(name: .init("test")!, value: "hi")],
-                forStream: 0
-            )
-            #expect(action5.fieldSection.lines.count == 1)
-
-            let action6 = stateMachine.receivedIncomingDecoderInstruction(.insertCountIncrement(increment: 1))
-            #expect(action6 == nil)
-        }
-    }
-
-    @Test
-    func testEncoderStreamReadyAfterShutdown() {
-        let localSettings = HTTP3Settings(qpackMaximumTableCapacity: 200)
-        let remoteSettings = HTTP3Settings(qpackMaximumTableCapacity: 100)
-        var stateMachine = HTTP3ConnectionStateMachine(settings: localSettings, type: .client)
-
-        let action1 = stateMachine.initialize()
-        #expect(action1 == .createControlAndDecoderStreams)
-
-        let action2 = stateMachine.receivedControlFrame(.settings(remoteSettings))
-        guard case .onSettings(let settings) = action2, settings.makeEncoderInstructionStream else {
-            Issue.record("Unexpected action \(String(describing: action2))")
-            return
-        }
-
-        #expect(stateMachine.shutdownConnectionImmediately() == .shutdown)
-
-        let action3 = stateMachine.outboundEncoderStreamReady(streamID: 2)
-        #expect(action3 == nil)  // We don't send our settings because we shutdown
     }
 
     // MARK: Stream tests
@@ -1083,15 +950,6 @@ struct HTTP3ConnectionStateMachineTests {
 
 // MARK: Test utils
 
-extension HTTP3ConnectionStateMachine.IncomingEncoderInstructionAction {
-    fileprivate var decoderInstructions: QPACKDecoderInstruction? {
-        switch self {
-        case .sendDecoderInstruction(let decoderInstruction): return decoderInstruction
-        case .emitConnectionError: return nil
-        }
-    }
-}
-
 extension HTTP3ConnectionStateMachine.InboundRequestStreamReceivedAction {
     fileprivate var isAddHandlers: Bool {
         switch self {
@@ -1248,23 +1106,6 @@ extension HTTP3ConnectionStateMachine {
     }
 
     /// Returns a state machine which has already exchanged settings with the 'remote' and created the required streams.
-    /// The settings are configured to allow qpack in both directions.
-    static func makeInitializedWithQPACK(
-        type: HTTP3ConnectionType,
-        idGenerator: inout IDGenerator
-    ) -> HTTP3ConnectionStateMachine {
-        let settings = HTTP3Settings(qpackMaximumTableCapacity: 1024, qpackBlockedStreams: 100)
-        return self.makeInitialized(
-            type: type,
-            idGenerator: &idGenerator,
-            localSettings: settings,
-            remoteSettings: settings,
-            expectLocalQPACK: true,
-            expectRemoteQPACK: true
-        )
-    }
-
-    /// Returns a state machine which has already exchanged settings with the 'remote' and created the required streams.
     ///
     /// - Parameters:
     ///   - type: The type of connection (client or server)
@@ -1272,15 +1113,13 @@ extension HTTP3ConnectionStateMachine {
     ///   - localSettings: The settings we use for the connection.
     ///   - remoteSettings: The settings the remote 'sent' us.
     ///   - expectLocalQPACK: Whether the provided settings are supposed to enable qpack locally. This affects what assertions we run wrt the streams we create.
-    ///   - expectRemoteQPACK: Whether the provided settings are supposed to enable qpack on the peer. This affects what assertions we run wrt the streams we create.
     /// - Returns: A state machine which has been initialized, created control streams both ways, and exchanged settings. Plus, QPACK streams are created if applicable.
     static func makeInitialized(
         type: HTTP3ConnectionType,
         idGenerator: inout IDGenerator,
         localSettings: HTTP3Settings = .init(),
         remoteSettings: HTTP3Settings = .init(),
-        expectLocalQPACK: Bool = false,
-        expectRemoteQPACK: Bool = false
+        expectLocalQPACK: Bool = false
     ) -> HTTP3ConnectionStateMachine {
         assert(idGenerator.type == type)
         var stateMachine = HTTP3ConnectionStateMachine(settings: localSettings, type: type)
@@ -1291,13 +1130,7 @@ extension HTTP3ConnectionStateMachine {
         case .createControlAndDecoderStreams:
             #expect(expectLocalQPACK)
             stateMachine.outboundControlStreamReady(streamID: idGenerator.outboundUni())
-            let action2 = stateMachine.outboundDecoderStreamReady(streamID: idGenerator.outboundUni())
-            switch action2 {
-            case .sendDecoderInstructions:
-                Issue.record()
-            case .none:
-                break  // Expected
-            }
+            stateMachine.outboundDecoderStreamReady(streamID: idGenerator.outboundUni())
         case .none:
             Issue.record()
         }
@@ -1314,18 +1147,10 @@ extension HTTP3ConnectionStateMachine {
         // receive remotes settings
         let action3 = stateMachine.receivedControlFrame(.settings(remoteSettings))
         switch action3 {
-        case .onSettings(let settings):
-            // We should be asked to make an encoder stream if and only if remote qpack is enabled.
-            #expect(settings.makeEncoderInstructionStream == expectRemoteQPACK)
-            if settings.makeEncoderInstructionStream {
-                let action3 = stateMachine.outboundEncoderStreamReady(streamID: idGenerator.outboundUni())
-                switch action3 {
-                case .sendEncoderInstruction(let ins):
-                    #expect(ins == .setDynamicTableCapacity(Int(localSettings.qpackMaximumTableCapacity)))
-                case .none:
-                    Issue.record()
-                }
-            }
+        case .onSettings:
+            // Creating the outbound QPACK encoder stream is driven by the `QPACKCoder`, not by this
+            // state machine, so there is nothing to assert here.
+            break
         default:
             Issue.record("Unexpected action \(String(describing: action3))")
         }

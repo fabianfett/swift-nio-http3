@@ -12,36 +12,56 @@
 //
 //===----------------------------------------------------------------------===//
 
+@_spi(PackageInternal) import HTTP3
 import NIOCore
+import NIOQUICHelpers
 @_spi(PackageInternal) import QPACK
 
 /// Read decoder instructions from a channel and give them to a callback.
 /// This belongs on the incoming decoder stream.
 /// The decoder instructions come from the remote decoder and should be fed into the local encoder.
-final class QPACKInboundDecoderStreamHandler: ChannelInboundHandler {
-    typealias InboundIn = QPACKDecoderInstruction
+final class QPACKInboundDecoderStreamHandler<
+    ConnectionDelegate: HTTP3.ConnectionDelegate,
+    StreamDelegate: HTTP3StreamDelegate
+>: ChannelInboundHandler {
+    typealias InboundIn = ByteBuffer
 
-    /// Called when an incoming instruction is successfully read.
-    private var onReceivedInstruction: (QPACKDecoderInstruction) -> Void
-    /// Called when an error is caught on this channel.
-    private var onError: (any Error) -> Void
+    private let qpackCoder: NIOQPACKCoder<ConnectionDelegate, StreamDelegate>
+    private var decoder: NIOSingleStepByteToMessageProcessor<QPACKDecoderInstructionDecoder>
 
-    init(
-        onReceivedInstruction: @escaping (QPACKDecoderInstruction) -> Void,
-        onError: @escaping (any Error) -> Void
-    ) {
-        self.onReceivedInstruction = onReceivedInstruction
-        self.onError = onError
+    init(qpackCoder: NIOQPACKCoder<ConnectionDelegate, StreamDelegate>) {
+        self.qpackCoder = qpackCoder
+        self.decoder = NIOSingleStepByteToMessageProcessor(QPACKDecoderInstructionDecoder())
     }
 
     func errorCaught(context: ChannelHandlerContext, error: any Error) {
-        self.onError(error)
-        context.fireErrorCaught(error)
+        let h3Error = HTTP3Error(
+            code: .qpackDecoderStreamError,
+            message: "Invalid QPACK instruction",
+            cause: error,
+            errorCode: .qpackDecoderStreamError,
+            location: .here()
+        )
+
+        self.qpackCoder.incomingDecoderInstructionStreamFailed(h3Error)
+        context.fireErrorCaught(h3Error)
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        let instruction = unwrapInboundIn(data)
-        self.onReceivedInstruction(instruction)
-        context.fireChannelRead(data)
+        let byteBuffer = self.unwrapInboundIn(data)
+        do {
+            try self.decoder.process(buffer: byteBuffer) { instruction in
+                self.qpackCoder.receivedIncomingDecoderInstruction(instruction)
+            }
+        } catch {
+            let h3Error = HTTP3Error(
+                code: .qpackDecoderStreamError,
+                message: "Invalid QPACK instruction",
+                cause: error,
+                errorCode: .qpackDecoderStreamError,
+                location: .here()
+            )
+            self.qpackCoder.incomingDecoderInstructionStreamFailed(h3Error)
+        }
     }
 }

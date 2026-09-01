@@ -28,13 +28,6 @@ import Testing
 
 final class TestDelegate: HTTP3StreamDelegate {
 
-    static func makeStaticEncoder() -> ([HTTPField], QUICStreamID) -> HTTP3PartialFrame.Headers {
-        { fields, _ in
-            let fieldSection = StaticQPACKEncoder().encode(headers: fields)
-            return HTTP3PartialFrame.Headers(fieldSection: fieldSection)
-        }
-    }
-
     static func makeUnexpectedStreamClose() -> (Bool, QUICStreamID, HTTP3StreamType.Framed) -> Void {
         { eof, _, _ in
             Issue.record("Unexpected closure of stream. Saw EOF: \(eof)")
@@ -47,31 +40,16 @@ final class TestDelegate: HTTP3StreamDelegate {
         }
     }
 
-    let _encodeHeaders: ([HTTPField], QUICStreamID) -> HTTP3PartialFrame.Headers
-    let _decodeHeaders: (HTTP3PartialFrame.Headers, QUICStreamID) -> Void
     let _onStreamClosed: (Bool, QUICStreamID, HTTP3StreamType.Framed) -> Void
     let _onConnectionError: (HTTP3Error) -> Void
 
     init(
-        encodeHeaders: @escaping ([HTTPField], QUICStreamID) -> HTTP3PartialFrame.Headers =
-            TestDelegate.makeStaticEncoder(),
-        decodeHeaders: @escaping (HTTP3PartialFrame.Headers, QUICStreamID) -> Void,
         onStreamClosed: @escaping (Bool, QUICStreamID, HTTP3StreamType.Framed) -> Void =
             TestDelegate.makeUnexpectedStreamClose(),
         onConnectionError: @escaping (HTTP3Error) -> Void = TestDelegate.makeUnexpectedConnectionError()
     ) {
-        self._encodeHeaders = encodeHeaders
-        self._decodeHeaders = decodeHeaders
         self._onStreamClosed = onStreamClosed
         self._onConnectionError = onConnectionError
-    }
-
-    func encodeHeaders(_ fields: [HTTPField], forStream streamID: QUICStreamID) -> HTTP3PartialFrame.Headers {
-        self._encodeHeaders(fields, streamID)
-    }
-
-    func decodeHeaders(_ fields: HTTP3PartialFrame.Headers, forStream streamID: QUICStreamID) {
-        self._decodeHeaders(fields, streamID)
     }
 
     func onStreamClosed(_ sawEOF: Bool, streamID: QUICStreamID, streamType: HTTP3StreamType.Framed) {
@@ -80,6 +58,46 @@ final class TestDelegate: HTTP3StreamDelegate {
 
     func onConnectionError(_ error: HTTP3Error) {
         self._onConnectionError(error)
+    }
+}
+
+/// The QPACK connection delegate. The ``HTTP3StreamHandler`` never talks to it directly, it is only used
+/// by the ``QPACKCoder`` which the handler is given.
+final class TestConnectionDelegate: HTTP3.ConnectionDelegate {
+    let _connectionError: (HTTP3Error) -> Void
+    let _makeOutboundEncoderStream: () -> Void
+
+    init(
+        connectionError: @escaping (HTTP3Error) -> Void = { Issue.record("Unexpected connection error \($0)") },
+        makeOutboundEncoderStream: @escaping () -> Void = {
+            Issue.record("Unexpected request to make an outbound encoder stream")
+        }
+    ) {
+        self._connectionError = connectionError
+        self._makeOutboundEncoderStream = makeOutboundEncoderStream
+    }
+
+    func connectionError(_ error: HTTP3Error) {
+        self._connectionError(error)
+    }
+
+    func makeOutboundEncoderStream() {
+        self._makeOutboundEncoderStream()
+    }
+}
+
+typealias TestQPACKCoder = NIOQPACKCoder<TestConnectionDelegate, TestDelegate>
+
+extension NIOHTTP3StreamHandlerTests {
+    /// A QPACK coder which allows blocked streams, so that ``blockedRequestPartialHeader`` isn't decoded straight away.
+    static func makeQPACKCoder(
+        connectionDelegate: TestConnectionDelegate = TestConnectionDelegate()
+    ) -> TestQPACKCoder {
+        TestQPACKCoder(
+            decoderMaxTableSize: 4096,
+            decoderMaxBlockedStreams: 16,
+            errorDelegate: connectionDelegate
+        )
     }
 }
 
@@ -105,25 +123,37 @@ struct NIOHTTP3StreamHandlerTests {
         return buffer
     }
 
-    private let testEncoderClosure: ([HTTPField], QUICStreamID) -> HTTP3PartialFrame.Headers = { fields, _ in
-        let fieldSection = StaticQPACKEncoder().encode(headers: fields)
-        return HTTP3PartialFrame.Headers(fieldSection: fieldSection)
+    /// A field section which references the first entry of the dynamic table.
+    ///
+    /// Since the tests never feed any encoder instructions into the coder, the required insert count of one
+    /// is never reached: the decode stays blocked until the test delivers a result to the handler by hand.
+    ///
+    /// The encoded required insert count of two means a required insert count of one, see RFC 9204 § 4.5.1.1.
+    private var blockedRequestPartialHeader: HTTP3PartialFrame.Headers {
+        .init(
+            fieldSection: FieldSection(
+                prefix: .init(encodedRequiredInsertCount: 2, deltaBase: 0, signBit: false),
+                lines: [.indexed(.dynamicTable, index: 0)]
+            )
+        )
+    }
+
+    private var blockedRequestPartialHeaderBytes: ByteBuffer {
+        var buffer = ByteBuffer()
+        buffer.writeHTTP3PartialFrame(.headers(self.blockedRequestPartialHeader), preferHuffmanEncoding: false)
+        return buffer
     }
 
     private let logger = Logger(label: "NIOHTTP3StreamHandlerTests")
 
     @Test
     func receiveInvalidHeaders() throws {
-        var headerToDecode: HTTP3PartialFrame.Headers?
         let handler = HTTP3StreamHandler(
             stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
             streamID: 5,
             streamType: .request,
-            delegate: TestDelegate(
-                decodeHeaders: { field, _ in
-                    headerToDecode = field
-                }
-            ),
+            qpackCoder: Self.makeQPACKCoder(),
+            delegate: TestDelegate(),
             logger: self.logger
         )
         let eventLoop = EmbeddedEventLoop()
@@ -131,8 +161,8 @@ struct NIOHTTP3StreamHandlerTests {
         let recorder = InboundDataRecorder(promise: recorderPromise, targetCount: 1)
         let channel = EmbeddedChannel(handlers: [handler, recorder], loop: eventLoop)
 
-        // Read in a test header
-        try channel.writeInbound(self.testRequestPartialHeaderBytes)
+        // Read in a test header, which can't be decoded yet
+        try channel.writeInbound(self.blockedRequestPartialHeaderBytes)
 
         // Give the qpack result
         let testError = HTTP3Error(
@@ -142,11 +172,7 @@ struct NIOHTTP3StreamHandlerTests {
             errorCode: .internalError,
             location: .here()
         )
-        guard let headerToDecode else {
-            Issue.record("Expected to have a header to decode")
-            return
-        }
-        handler.onQPACKDecodeError(testError, forHeaders: headerToDecode)
+        handler.onQPACKDecodeError(testError)
 
         expectH3Error(code: .qpackDecoderError, h3ErrorCode: .internalError, message: "test") {
             _ = try recorderPromise.futureResult.wait()
@@ -156,16 +182,12 @@ struct NIOHTTP3StreamHandlerTests {
     /// Receive headers which can't yet be decoded, but can be later.
     @Test
     func receiveHeadersWhichNeedInstructions() throws {
-        var headerToDecode: HTTP3PartialFrame.Headers?
         let handler = HTTP3StreamHandler(
             stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
             streamID: 5,
             streamType: .request,
-            delegate: TestDelegate(
-                decodeHeaders: { field, _ in
-                    headerToDecode = field
-                }
-            ),
+            qpackCoder: Self.makeQPACKCoder(),
+            delegate: TestDelegate(),
             logger: self.logger
         )
         let eventLoop = EmbeddedEventLoop()
@@ -178,15 +200,12 @@ struct NIOHTTP3StreamHandlerTests {
         let channel = EmbeddedChannel(handlers: [handler, eventRecorder], loop: eventLoop)
         #expect(seenEvents.popFirst()?.isChannelRegistered == true)
 
-        // Read in a test header
-        try channel.writeInbound(self.testRequestPartialHeaderBytes)
+        // Read in a test header, which can't be decoded yet
+        try channel.writeInbound(self.blockedRequestPartialHeaderBytes)
+        #expect(seenEvents.isEmpty())
 
         // Make the result available
-        guard let headerToDecode else {
-            Issue.record("Expected to have a header to decode")
-            return
-        }
-        handler.onQPACKDecodeResult(fields: self.testRequestHeaderFields, forHeaders: headerToDecode)
+        handler.onQPACKDecodeResult(fields: self.testRequestHeaderFields)
 
         // Make sure we read the right value
         guard let readFrameAny = seenEvents.popFirst()?.readValue else {
@@ -203,16 +222,12 @@ struct NIOHTTP3StreamHandlerTests {
 
     @Test
     func receiveUnknownFrameFollowedByHeaders() throws {
-        var headerToDecode: HTTP3PartialFrame.Headers?
         let handler = HTTP3StreamHandler(
             stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
             streamID: 5,
             streamType: .request,
-            delegate: TestDelegate(
-                decodeHeaders: { field, _ in
-                    headerToDecode = field
-                }
-            ),
+            qpackCoder: Self.makeQPACKCoder(),
+            delegate: TestDelegate(),
             logger: self.logger
         )
         let eventLoop = EmbeddedEventLoop()
@@ -225,18 +240,14 @@ struct NIOHTTP3StreamHandlerTests {
         let channel = EmbeddedChannel(handlers: [handler, eventRecorder], loop: eventLoop)
         #expect(seenEvents.popFirst()?.isChannelRegistered == true)
 
-        // Read in an unknown frame followed by a test header
+        // Read in an unknown frame followed by a test header which can't be decoded yet
         let testUnknownFrameBytes: [UInt8] = [0x40, 0xdb, 0x00]
         var bufferToWriteIn = ByteBuffer(bytes: testUnknownFrameBytes)
-        bufferToWriteIn.writeImmutableBuffer(self.testRequestPartialHeaderBytes)
+        bufferToWriteIn.writeImmutableBuffer(self.blockedRequestPartialHeaderBytes)
         try channel.writeInbound(bufferToWriteIn)
 
         // Make the QPACK result available
-        guard let headerToDecode else {
-            Issue.record("Expected to have a header to decode")
-            return
-        }
-        handler.onQPACKDecodeResult(fields: self.testRequestHeaderFields, forHeaders: headerToDecode)
+        handler.onQPACKDecodeResult(fields: self.testRequestHeaderFields)
 
         // Make sure we read the right value
         guard let readFrameAny = seenEvents.popFirst()?.readValue else {
@@ -251,17 +262,158 @@ struct NIOHTTP3StreamHandlerTests {
         #expect(seenEvents.isEmpty())
     }
 
+    /// Frames are forwarded as soon as the bytes carrying them arrive, not held back until the read
+    /// burst ends.
+    @Test
+    func framesAreForwardedBeforeReadComplete() throws {
+        let eventLoop = EmbeddedEventLoop()
+        let handler = HTTP3StreamHandler(
+            stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
+            streamID: 5,
+            streamType: .request,
+            qpackCoder: Self.makeQPACKCoder(),
+            delegate: TestDelegate(onStreamClosed: { _, _, _ in }),
+            logger: self.logger
+        )
+        let seenEvents = NIOLockedValueBox<Deque<DebugInboundEventsHandler.Event>>([])
+        let eventRecorder = DebugInboundEventsHandler { event, _ in
+            seenEvents.withLockedValue { $0.append(event) }
+        }
+        let channel = EmbeddedChannel(handlers: [handler, eventRecorder], loop: eventLoop)
+        #expect(seenEvents.popFirst()?.isChannelRegistered == true)
+
+        // A read carrying the head, with no read complete behind it.
+        channel.pipeline.fireChannelRead(self.testRequestPartialHeaderBytes)
+
+        let headRead = try #require(seenEvents.popFirst()?.readValue)
+        #expect(handler.unwrapOutboundIn(headRead) == self.testRequestHeaderFrame)
+        #expect(seenEvents.isEmpty())
+
+        // A data frame split across two reads. Its payload flows out as it arrives: we neither wait for
+        // the whole frame nor for the end of the burst.
+        var dataBytes = ByteBuffer()
+        dataBytes.writeHTTP3PartialFrame(.data(.init(string: "hello world")), preferHuffmanEncoding: false)
+        let head = dataBytes.readSlice(length: 4)!  // frame type, payload length, and "he"
+        let rest = dataBytes
+
+        channel.pipeline.fireChannelRead(head)
+        let firstDataRead = try #require(seenEvents.popFirst()?.readValue)
+        #expect(handler.unwrapOutboundIn(firstDataRead) == .data(.init(string: "he")))
+        #expect(seenEvents.isEmpty())
+
+        channel.pipeline.fireChannelRead(rest)
+        let secondDataRead = try #require(seenEvents.popFirst()?.readValue)
+        #expect(handler.unwrapOutboundIn(secondDataRead) == .data(.init(string: "llo world")))
+        #expect(seenEvents.isEmpty())
+
+        // One read complete covers everything we delivered during the burst.
+        channel.pipeline.fireChannelReadComplete()
+        #expect(seenEvents.popFirst()?.isChannelReadComplete == true)
+        #expect(seenEvents.isEmpty())
+    }
+
+    /// While a QPACK decode is outstanding, nothing may overtake it: the frame the decoder had already
+    /// produced is held, the bytes behind it stay undecoded, and everything comes out in order once the
+    /// decode result arrives.
+    @Test
+    func pausesDecodingWhileHeaderDecodeIsOutstanding() throws {
+        let eventLoop = EmbeddedEventLoop()
+        let handler = HTTP3StreamHandler(
+            stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
+            streamID: 5,
+            streamType: .request,
+            qpackCoder: Self.makeQPACKCoder(),
+            delegate: TestDelegate(onStreamClosed: { _, _, _ in }),
+            logger: self.logger
+        )
+        let seenEvents = NIOLockedValueBox<Deque<DebugInboundEventsHandler.Event>>([])
+        let eventRecorder = DebugInboundEventsHandler { event, _ in
+            seenEvents.withLockedValue { $0.append(event) }
+        }
+        let channel = EmbeddedChannel(handlers: [handler, eventRecorder], loop: eventLoop)
+        #expect(seenEvents.popFirst()?.isChannelRegistered == true)
+
+        // A head whose QPACK decode can't complete: it references a dynamic table entry we never send.
+        channel.pipeline.fireChannelRead(self.blockedRequestPartialHeaderBytes)
+        #expect(seenEvents.isEmpty())
+
+        // More frames arrive while that decode is outstanding. The body is decoded and then held, and the
+        // trailers behind it are never even decoded: the processor still has those bytes.
+        let trailerFields: [HTTPField] = [.init(name: .init("trailer-field")!, value: "value")]
+        var moreBytes = ByteBuffer()
+        moreBytes.writeHTTP3PartialFrame(.data(.init(string: "hello world")), preferHuffmanEncoding: false)
+        moreBytes.writeHTTP3PartialFrame(
+            .headers(.init(fieldSection: StaticQPACKEncoder().encode(headers: trailerFields))),
+            preferHuffmanEncoding: false
+        )
+        channel.pipeline.fireChannelRead(moreBytes)
+        channel.pipeline.fireChannelReadComplete()
+
+        // Nothing at all has gone downstream: not even a read complete, because nothing was read.
+        #expect(seenEvents.isEmpty())
+
+        // The decode lands. Now the head, then everything queued behind it, in the order it arrived.
+        handler.onQPACKDecodeResult(fields: self.testRequestHeaderFields)
+
+        let headRead = try #require(seenEvents.popFirst()?.readValue)
+        #expect(handler.unwrapOutboundIn(headRead) == self.testRequestHeaderFrame)
+
+        let dataRead = try #require(seenEvents.popFirst()?.readValue)
+        #expect(handler.unwrapOutboundIn(dataRead) == .data(.init(string: "hello world")))
+
+        let trailerRead = try #require(seenEvents.popFirst()?.readValue)
+        #expect(handler.unwrapOutboundIn(trailerRead) == .headers(trailerFields))
+
+        // One read complete covers the frames the decode released.
+        #expect(seenEvents.popFirst()?.isChannelReadComplete == true)
+        #expect(seenEvents.isEmpty())
+    }
+
+    /// A read burst containing several frames must produce exactly one `channelReadComplete`, even
+    /// though the QPACK decodes in it complete synchronously and re-enter `channelReadComplete`.
+    @Test
+    func readCompleteIsFiredOncePerReadBurst() throws {
+        let eventLoop = EmbeddedEventLoop()
+        let handler = HTTP3StreamHandler(
+            stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
+            streamID: 5,
+            streamType: .request,
+            qpackCoder: Self.makeQPACKCoder(),
+            delegate: TestDelegate(onStreamClosed: { _, _, _ in }),
+            logger: self.logger
+        )
+        let seenEvents = NIOLockedValueBox<Deque<DebugInboundEventsHandler.Event>>([])
+        let eventRecorder = DebugInboundEventsHandler { event, _ in
+            seenEvents.withLockedValue { $0.append(event) }
+        }
+        let channel = EmbeddedChannel(handlers: [handler, eventRecorder], loop: eventLoop)
+        #expect(seenEvents.popFirst()?.isChannelRegistered == true)
+
+        // Head, body and trailers, all in one read. The head and the trailers are statically encoded, so
+        // both decode without needing anything from the peer's encoder.
+        let trailerFields: [HTTPField] = [.init(name: .init("trailer-field")!, value: "value")]
+        var buffer = ByteBuffer()
+        buffer.writeHTTP3PartialFrame(.headers(self.testRequestPartialHeader), preferHuffmanEncoding: false)
+        buffer.writeHTTP3PartialFrame(.data(.init(string: "hello world")), preferHuffmanEncoding: false)
+        buffer.writeHTTP3PartialFrame(
+            .headers(.init(fieldSection: StaticQPACKEncoder().encode(headers: trailerFields))),
+            preferHuffmanEncoding: false
+        )
+        try channel.writeInbound(buffer)
+
+        let events = seenEvents.withLockedValue { $0 }
+        #expect(events.filter { $0.readValue != nil }.count == 3)
+        #expect(events.filter { $0.isChannelReadComplete }.count == 1)
+    }
+
     @Test
     func write() throws {
         let handler = HTTP3StreamHandler(
             stateMachine: .init(streamType: .control, incoming: false, preferHuffmanEncoding: false),
             streamID: 5,
             streamType: .request,
-            delegate: TestDelegate(
-                decodeHeaders: { field, _ in
-                    Issue.record("Unexpected header decode \(field)")
-                }
-            ),
+            qpackCoder: Self.makeQPACKCoder(),
+            delegate: TestDelegate(),
             logger: self.logger
         )
         let eventLoop = EmbeddedEventLoop()
@@ -283,11 +435,8 @@ struct NIOHTTP3StreamHandlerTests {
             stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
             streamID: 5,
             streamType: .request,
-            delegate: TestDelegate(
-                decodeHeaders: { field, _ in
-                    Issue.record("Unexpected header decode \(field)")
-                }
-            ),
+            qpackCoder: Self.makeQPACKCoder(),
+            delegate: TestDelegate(),
             logger: self.logger
         )
         let eventLoop = EmbeddedEventLoop()
@@ -313,11 +462,8 @@ struct NIOHTTP3StreamHandlerTests {
             stateMachine: .init(streamType: .request, incoming: false, preferHuffmanEncoding: false),
             streamID: 5,
             streamType: .request,
-            delegate: TestDelegate(
-                decodeHeaders: { field, _ in
-                    Issue.record("Unexpected header decode \(field)")
-                }
-            ),
+            qpackCoder: Self.makeQPACKCoder(),
+            delegate: TestDelegate(),
             logger: self.logger
         )
         let eventLoop = EmbeddedEventLoop()
@@ -345,10 +491,8 @@ struct NIOHTTP3StreamHandlerTests {
             stateMachine: .init(streamType: .request, incoming: false, preferHuffmanEncoding: false),
             streamID: 5,
             streamType: .request,
+            qpackCoder: Self.makeQPACKCoder(),
             delegate: TestDelegate(
-                decodeHeaders: { field, _ in
-                    Issue.record("Unexpected header decode \(field)")
-                },
                 onStreamClosed: { eof, _, _ in sawEOF.succeed(eof) }
             ),
             logger: self.logger
@@ -377,10 +521,8 @@ struct NIOHTTP3StreamHandlerTests {
             stateMachine: .init(streamType: .control, incoming: false, preferHuffmanEncoding: false),
             streamID: 5,
             streamType: .control,
+            qpackCoder: Self.makeQPACKCoder(),
             delegate: TestDelegate(
-                decodeHeaders: { field, _ in
-                    Issue.record("Unexpected header decode \(field)")
-                },
                 onConnectionError: { connectionErrorPromise.succeed($0) }
             ),
             logger: self.logger
@@ -410,10 +552,8 @@ struct NIOHTTP3StreamHandlerTests {
             stateMachine: .init(streamType: .control, incoming: false, preferHuffmanEncoding: false),
             streamID: 5,
             streamType: .control,
+            qpackCoder: Self.makeQPACKCoder(),
             delegate: TestDelegate(
-                decodeHeaders: { field, _ in
-                    Issue.record("Unexpected header decode \(field)")
-                },
                 onStreamClosed: { eof, _, _ in streamClosedPromise.succeed(eof) },
             ),
             logger: self.logger
@@ -433,10 +573,8 @@ struct NIOHTTP3StreamHandlerTests {
             stateMachine: .init(streamType: .control, incoming: false, preferHuffmanEncoding: false),
             streamID: 5,
             streamType: .control,
+            qpackCoder: Self.makeQPACKCoder(),
             delegate: TestDelegate(
-                decodeHeaders: { field, _ in
-                    Issue.record("Unexpected header decode \(field)")
-                },
                 onStreamClosed: { eof, _, _ in streamClosedPromise.succeed(eof) },
             ),
             logger: self.logger
@@ -458,8 +596,8 @@ struct NIOHTTP3StreamHandlerTests {
             stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
             streamID: 5,
             streamType: .request,
+            qpackCoder: Self.makeQPACKCoder(),
             delegate: TestDelegate(
-                decodeHeaders: { _, _ in },
                 onStreamClosed: { eof, _, _ in streamClosedPromise.succeed(eof) },
             ),
             logger: self.logger
@@ -487,8 +625,8 @@ struct NIOHTTP3StreamHandlerTests {
             }
         }
 
-        // Read in a test header
-        try channel.writeInbound(self.testRequestPartialHeaderBytes)
+        // Read in a test header, which can't be decoded yet
+        try channel.writeInbound(self.blockedRequestPartialHeaderBytes)
 
         // Close the input
         channel.pipeline.fireUserInboundEventTriggered(ChannelEvent.inputClosed)
@@ -500,8 +638,9 @@ struct NIOHTTP3StreamHandlerTests {
     }
 
     @Test
-    // Make sure that if we have buffered data which we didn't fire read for, then we do so before forwarding channel inactive.
-    func flushBuffersWhenChannelInactive() throws {
+    // Make sure that if we fired reads which no read complete has followed, we fire one before forwarding
+    // channel inactive.
+    func flushReadCompleteWhenChannelInactive() throws {
         let eventLoop = EmbeddedEventLoop()
         // The bool is true if the close was clean, ie we saw EOF
         let streamClosedPromise = eventLoop.makePromise(of: Bool.self)
@@ -509,8 +648,8 @@ struct NIOHTTP3StreamHandlerTests {
             stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
             streamID: 5,
             streamType: .request,
+            qpackCoder: Self.makeQPACKCoder(),
             delegate: TestDelegate(
-                decodeHeaders: { _, _ in },
                 onStreamClosed: { eof, _, _ in streamClosedPromise.succeed(eof) },
             ),
             logger: self.logger
@@ -522,17 +661,15 @@ struct NIOHTTP3StreamHandlerTests {
         }
         let channel = EmbeddedChannel(handlers: [handler, eventRecorder], loop: eventLoop)
 
-        // We can't insert an inactive after a header because the qpack decode immediately triggers a channel read.
-        // So we have to do it after a data instead.
-        // But we can't send a data until we've sent a header, because HTTP/3 rules.
-        // Read in a test header
-        try channel.writeInbound(self.testRequestPartialHeaderBytes)
+        // We can't send a data until we've sent a header, because HTTP/3 rules.
+        // Read in a test header, which can't be decoded yet
+        try channel.writeInbound(self.blockedRequestPartialHeaderBytes)
 
         #expect(seenEvents.popFirst()?.isChannelRegistered == true)
         #expect(seenEvents.isEmpty())
 
         // Give the stream the header decode result
-        handler.onQPACKDecodeResult(fields: self.testRequestHeaderFields, forHeaders: self.testRequestPartialHeader)
+        handler.onQPACKDecodeResult(fields: self.testRequestHeaderFields)
 
         guard let headerReadEvent = seenEvents.popFirst()?.readValue else {
             Issue.record("Expected a read event")
@@ -545,7 +682,14 @@ struct NIOHTTP3StreamHandlerTests {
         var dataBytes = ByteBuffer()
         dataBytes.writeHTTP3PartialFrame(.data(.init(string: "hello world")), preferHuffmanEncoding: false)
         channel.pipeline.fireChannelRead(dataBytes)
-        // We do not fire a read complete. So the bytes get buffered, but nothing comes out.
+
+        // The frame is forwarded as soon as its bytes arrive...
+        guard let dataReadEvent = seenEvents.popFirst()?.readValue else {
+            Issue.record("Expected a read event")
+            return
+        }
+        #expect(handler.unwrapOutboundIn(dataReadEvent) == .data(.init(string: "hello world")))
+        // ...but we never fired a read complete, so one is still owed downstream.
         #expect(seenEvents.isEmpty())
 
         // Close
@@ -553,13 +697,7 @@ struct NIOHTTP3StreamHandlerTests {
         let sawEOF = try streamClosedPromise.futureResult.wait()
         #expect(sawEOF == false)  // We did not see an EOF before close
 
-        // Now we see the data read
-        guard let dataReadEvent = seenEvents.popFirst()?.readValue else {
-            Issue.record("Expected a read event")
-            return
-        }
-        // We see the channel read and read complete and THEN the inactive
-        #expect(handler.unwrapOutboundIn(dataReadEvent) == .data(.init(string: "hello world")))
+        // The outstanding read complete is paid before the inactive goes downstream
         #expect(seenEvents.popFirst()?.isChannelReadComplete == true)
         #expect(seenEvents.popFirst()?.isChannelInactive == true)
         #expect(seenEvents.popFirst()?.isChannelUnregistered == true)
@@ -574,8 +712,8 @@ struct NIOHTTP3StreamHandlerTests {
             stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
             streamID: 5,
             streamType: .request,
+            qpackCoder: Self.makeQPACKCoder(),
             delegate: TestDelegate(
-                decodeHeaders: { _, _ in },
                 onStreamClosed: { _, _, _ in },
             ),
             logger: self.logger
@@ -584,9 +722,9 @@ struct NIOHTTP3StreamHandlerTests {
         let recorder = InboundDataRecorder(promise: recorderPromise, targetCount: 2)
         let channel = EmbeddedChannel(handlers: [handler, recorder], loop: eventLoop)
 
-        // Headers frame
-        try channel.writeInbound(self.testRequestPartialHeaderBytes)
-        handler.onQPACKDecodeResult(fields: self.testRequestHeaderFields, forHeaders: self.testRequestPartialHeader)
+        // Headers frame, which can't be decoded yet
+        try channel.writeInbound(self.blockedRequestPartialHeaderBytes)
+        handler.onQPACKDecodeResult(fields: self.testRequestHeaderFields)
 
         // Input close
         channel.pipeline.fireUserInboundEventTriggered(ChannelEvent.inputClosed)
@@ -608,8 +746,8 @@ struct NIOHTTP3StreamHandlerTests {
             stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
             streamID: 5,
             streamType: .request,
+            qpackCoder: Self.makeQPACKCoder(),
             delegate: TestDelegate(
-                decodeHeaders: { _, _ in },
                 onStreamClosed: { _, _, _ in },
             ),
             logger: self.logger
@@ -658,8 +796,8 @@ struct NIOHTTP3StreamHandlerTests {
             stateMachine: .init(streamType: .request, incoming: false, preferHuffmanEncoding: false),
             streamID: 5,
             streamType: .request,
+            qpackCoder: Self.makeQPACKCoder(),
             delegate: TestDelegate(
-                decodeHeaders: { _, _ in },
                 onStreamClosed: { _, _, _ in },
             ),
             logger: self.logger

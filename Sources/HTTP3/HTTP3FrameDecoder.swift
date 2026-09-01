@@ -12,13 +12,17 @@
 //
 //===----------------------------------------------------------------------===//
 
+public import NIOCore
 @_spi(PackageInternal) import QPACK
 
-import struct NIOCore.ByteBuffer
-
 /// A decoder for ``HTTP3PartialFrame``.
-struct HTTP3FrameDecoder: ~Copyable {
-    typealias InboundOut = HTTP3PartialFrame
+///
+/// This is a ``NIOSingleStepByteToMessageDecoder``, so a ``NIOSingleStepByteToMessageProcessor`` does the
+/// buffering of partial frames for us: this type only ever reads whole frames out of whatever it is given.
+@_spi(PackageInternal)
+public struct HTTP3FrameDecoder: NIOSingleStepByteToMessageDecoder {
+    @_spi(PackageInternal)
+    public typealias InboundOut = HTTP3DecodedFrame
 
     /// An enum indicating the next step when decoding HTTP/3 frames.
     private enum NextStep: Hashable {
@@ -40,17 +44,19 @@ struct HTTP3FrameDecoder: ~Copyable {
         /// We can continue decoding.
         case continueDecodeLoop
         /// We have decoded the next frame and need to return it.
-        case returnFrame(HTTP3PartialFrameOrUnknown)
+        case returnFrame(HTTP3DecodedFrame)
     }
 
     /// Indicates the next decoding step.
     private var nextStep: NextStep = .decodeFrameType
 
-    init() {}
+    @_spi(PackageInternal)
+    public init() {}
 
     /// - Note: Any error thrown from here should be treated as a connection-level error.
     /// - Returns: A frame if one can be decoded from the available bytes, or `nil` if more bytes are needed.
-    mutating func decode(buffer: inout ByteBuffer) throws(HTTP3Error) -> HTTP3PartialFrameOrUnknown? {
+    @_spi(PackageInternal)
+    public mutating func decode(buffer: inout ByteBuffer) throws(HTTP3Error) -> HTTP3DecodedFrame? {
         while true {
             switch try self.next(buffer: &buffer) {
             case .returnFrame(let frame):
@@ -63,6 +69,28 @@ struct HTTP3FrameDecoder: ~Copyable {
                 ()
             }
         }
+    }
+
+    /// Decode when no more bytes will arrive.
+    ///
+    /// - Returns: Any frame still readable from the buffer, then ``HTTP3DecodedFrame/truncated`` if the
+    ///     input stopped part way through a frame, then `nil`.
+    @_spi(PackageInternal)
+    public mutating func decodeLast(buffer: inout ByteBuffer, seenEOF: Bool) throws(HTTP3Error) -> HTTP3DecodedFrame? {
+        if let frame = try self.decode(buffer: &buffer) {
+            return frame
+        }
+
+        guard buffer.readableBytes > 0 || self.hasPartialFrame else {
+            // Everything the peer sent was a whole number of frames. Nothing left to report.
+            return nil
+        }
+
+        // Drop what is left and reset, so that the next call ends the loop rather than reporting the same
+        // truncated frame over and over.
+        buffer.moveReaderIndex(forwardBy: buffer.readableBytes)
+        self.nextStep = .decodeFrameType
+        return .truncated
     }
 
     /// True if this decoder has consumed some bytes to start building up a frame, but has not completed doing so
@@ -147,13 +175,17 @@ struct HTTP3FrameDecoder: ~Copyable {
                 buffer.moveReaderIndex(forwardBy: remainingLength)
                 // We have finished skipping bytes.
                 self.nextStep = .decodeFrameType
+                return .continueDecodeLoop
             } else {
                 buffer.moveReaderIndex(forwardBy: readableBytes)
                 let newRemainingLength = remainingLength - readableBytes
                 // Need to skip more bytes still.
                 self.nextStep = .skipBytes(length: newRemainingLength)
+                // We just consumed everything there was, so there is nothing left to decode. Continuing
+                // the loop here would spin forever: the next pass would skip zero bytes and land right
+                // back in this step with the same remaining length.
+                return .waitForMoreBytes
             }
-            return .continueDecodeLoop
         case .decodePayload(let type, let length):
             // Make sure the length is not excessive. If it is, drop the frame.
             guard length <= type.maximumAcceptableLength else {
@@ -216,7 +248,7 @@ extension ByteBuffer {
     /// `self` should be the payload, already sliced to the right length.
     /// - Returns: The frame, or nil if there aren't enough bytes.
     /// - Throws: If a frame is malformed in a specific way, e.g. a setting identifier is forbidden.
-    fileprivate mutating func readHTTP3Frame(type: HTTP3FrameType) throws(HTTP3Error) -> HTTP3PartialFrameOrUnknown? {
+    fileprivate mutating func readHTTP3Frame(type: HTTP3FrameType) throws(HTTP3Error) -> HTTP3DecodedFrame? {
         switch type {
         case .data:
             fatalError("Implementation error, this function should not be used to read a whole data frame.")
@@ -278,9 +310,18 @@ extension ByteBuffer {
     }
 }
 
-enum HTTP3PartialFrameOrUnknown: Hashable {
+/// What ``HTTP3FrameDecoder`` produces.
+@_spi(PackageInternal)
+public enum HTTP3DecodedFrame: Hashable {
+    /// A frame of a type we know. Note that DATA frames are emitted in pieces as their payload arrives.
     case known(HTTP3PartialFrame)
+    /// A frame of a type we don't know. Its payload is skipped over, so there is nothing to hand over.
     case unknown
+    /// The input ended part way through a frame.
+    ///
+    /// RFC 9114 § 7.1: When a stream terminates cleanly, if the last frame on the stream was truncated, this
+    /// MUST be treated as a connection error of type H3\_FRAME\_ERROR.
+    case truncated
 }
 
 extension HTTP3FrameType {
