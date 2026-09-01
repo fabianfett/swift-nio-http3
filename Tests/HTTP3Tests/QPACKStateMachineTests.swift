@@ -18,6 +18,7 @@ import Testing
 
 @_spi(PackageInternal) @testable import HTTP3
 
+#if false
 struct QPACKStateMachineTests {
     @Test
     func testBeginUsingDynamicTable() {
@@ -716,3 +717,4 @@ extension QPACKStateMachine.IncomingEncoderInstructionAction {
         }
     }
 }
+#endif

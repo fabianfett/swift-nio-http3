@@ -35,7 +35,6 @@ struct OutboundQPACKEncoderChannel: HTTP3.QPACKOutboundEncoderStream, ~Copyable 
 }
 
 struct OutboundQPACKDecoderChannel: HTTP3.QPACKOutboundDecoderStream, ~Copyable {
-
     let encoder: QPACKDecoderInstructionEncoder
 
     var channel: any Channel
@@ -64,23 +63,9 @@ struct OutboundQPACKDecoderChannel: HTTP3.QPACKOutboundDecoderStream, ~Copyable 
     }
 }
 
-typealias NIOQPACKCoder<QUICStreamCreator: NIOQUICHelpers.QUICStreamCreator> = HTTP3.QPACKCoder<
+typealias NIOQPACKCoder<QUICStreamCreator: NIOQUICHelpers.QUICStreamCreator, StreamDelegate: HTTP3StreamDelegate> = HTTP3.QPACKCoder<
     OutboundQPACKEncoderChannel,
     OutboundQPACKDecoderChannel,
     HTTP3ConnectionCoordinator<QUICStreamCreator>,
-    HTTP3StreamHandler<HTTP3ConnectionCoordinator<QUICStreamCreator>, NIOQPACKCoderWrapper<QUICStreamCreator>>
+    HTTP3StreamHandler<StreamDelegate, QUICStreamCreator>
 >
-
-struct NIOQPACKCoderWrapper<QUICStreamCreator: NIOQUICHelpers.QUICStreamCreator>: NIOHTTP3.QPACKCoder {
-    typealias Receiver = HTTP3StreamHandler<HTTP3ConnectionCoordinator<QUICStreamCreator>, NIOQPACKCoderWrapper<QUICStreamCreator>>
-
-    let coder: NIOQPACKCoder<QUICStreamCreator>
-
-    func encodeHeaders(_ fields: [HTTPField], forStream streamID: QUICStreamID) -> HTTP3PartialFrame.Headers {
-        self.coder.encodeHeaders(fields, forStream: streamID)
-    }
-
-    func decodeHeaders(_ headers: HTTP3PartialFrame.Headers, forStream streamID: QUICStreamID, decodeReceiver: Receiver) {
-        self.decodeHeaders(headers, forStream: streamID, decodeReceiver: decodeReceiver)
-    }
-}

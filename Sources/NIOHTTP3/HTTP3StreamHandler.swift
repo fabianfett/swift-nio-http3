@@ -47,7 +47,10 @@ protocol QPACKCoder {
 /// This handler should be added to every incoming and outgoing HTTP/3 stream which carries HTTP frames.
 /// It handles encoding and decoding of these frames.
 /// It will only pass through valid frames, and handles things such as QPACK header decoding.
-final class HTTP3StreamHandler<QPACKCoder: NIOHTTP3.QPACKCoder, Delegate: HTTP3StreamDelegate>: ChannelDuplexHandler where QPACKCoder.Receiver == HTTP3StreamHandler<QPACKCoder, Delegate> {
+final class HTTP3StreamHandler<
+    Delegate: HTTP3StreamDelegate,
+    QUICStreamCreator: NIOQUICHelpers.QUICStreamCreator
+>: ChannelDuplexHandler {
     typealias InboundIn = ByteBuffer
     typealias InboundOut = HTTP3Frame
 
@@ -58,7 +61,7 @@ final class HTTP3StreamHandler<QPACKCoder: NIOHTTP3.QPACKCoder, Delegate: HTTP3S
     private let streamType: HTTP3StreamType.Framed
 
     private let delegate: Delegate
-    private let qpackCoder: QPACKCoder
+    private let qpackCoder: NIOQPACKCoder<QUICStreamCreator, Delegate>
 
     /// The channel context. This handler can only be in one channel at a time.
     private var context: ChannelHandlerContext?
@@ -78,12 +81,14 @@ final class HTTP3StreamHandler<QPACKCoder: NIOHTTP3.QPACKCoder, Delegate: HTTP3S
         stateMachine: consuming HTTP3StreamStateMachine,
         streamID: QUICStreamID,
         streamType: HTTP3StreamType.Framed,
+        qpackCoder: NIOQPACKCoder<QUICStreamCreator, Delegate>,
         delegate: Delegate,
         logger: Logger
     ) {
         self.streamID = streamID
         self.streamType = streamType
         self.stateMachine = stateMachine
+        self.qpackCoder = qpackCoder
         self.delegate = delegate
         self.logger = logger
     }
@@ -222,7 +227,7 @@ final class HTTP3StreamHandler<QPACKCoder: NIOHTTP3.QPACKCoder, Delegate: HTTP3S
                 didFireChannelRead = true
             case .decodeHeader(let partialHeader):
                 self.logger.trace("HTTP3StreamHandler waiting for QPACK decode")
-                self.qpackCoder.decodeHeaders(partialHeader, forStream: self.streamID)
+                self.qpackCoder.decodeHeaders(partialHeader, forStream: self.streamID, decodeReceiver: self)
             case .emitStreamError(let error):
                 context.triggerUserOutboundEvent(
                     QUICStopSendingEvent(code: QUICApplicationErrorCode(error.h3ErrorCode ?? .noError)),
@@ -273,7 +278,7 @@ final class HTTP3StreamHandler<QPACKCoder: NIOHTTP3.QPACKCoder, Delegate: HTTP3S
             context.fireErrorCaught(error)
             promise?.fail(error)
         case .encodeHeaders(let fields):
-            let encoded = self.delegate.encodeHeaders(fields, forStream: self.streamID)
+            let encoded = self.qpackCoder.encodeHeaders(fields, forStream: self.streamID)
             let action = self.stateMachine.gotHeaderEncodeResult(encoded, from: fields, into: &self.pendingBytes!)
 
             switch action {

@@ -14,34 +14,43 @@
 
 import NIOCore
 @_spi(PackageInternal) import QPACK
+@_spi(PackageInternal) import HTTP3
 import NIOQUICHelpers
 
 /// Read decoder instructions from a channel and give them to a callback.
 /// This belongs on the incoming decoder stream.
 /// The decoder instructions come from the remote decoder and should be fed into the local encoder.
-final class QPACKInboundDecoderStreamHandler<QUICStreamCreator: NIOQUICHelpers.QUICStreamCreator>: ChannelInboundHandler {
+final class QPACKInboundDecoderStreamHandler<QUICStreamCreator: NIOQUICHelpers.QUICStreamCreator, StreamDelegate: HTTP3StreamDelegate>: ChannelInboundHandler {
     typealias InboundIn = ByteBuffer
 
-    private let qpackCoder: NIOQPACKCoder<QUICStreamCreator>
+    private let qpackCoder: NIOQPACKCoder<QUICStreamCreator, StreamDelegate>
     private var decoder: NIOSingleStepByteToMessageProcessor<QPACKDecoderInstructionDecoder>
 
-    init(qpackCoder: NIOQPACKCoder<QUICStreamCreator>) {
+    init(qpackCoder: NIOQPACKCoder<QUICStreamCreator, StreamDelegate>) {
         self.qpackCoder = qpackCoder
+        self.decoder = NIOSingleStepByteToMessageProcessor(QPACKDecoderInstructionDecoder())
     }
 
-    func errorCaught(context: ChannelHandlerContext, error: any Error) {
+    func errorCaught(context: ChannelHandlerContext, error: HTTP3Error) {
         self.qpackCoder.incomingDecoderInstructionStreamFailed(error)
         context.fireErrorCaught(error)
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
-        var byteBuffer = self.unwrapInboundIn(data)
+        let byteBuffer = self.unwrapInboundIn(data)
         do {
             try self.decoder.process(buffer: byteBuffer) { instruction in
                 self.qpackCoder.receivedIncomingDecoderInstruction(instruction)
             }
         } catch {
-            self.qpackCoder.incomingDecoderInstructionStreamFailed(error)
+            let h3Error = HTTP3Error(
+                code: .qpackDecoderStreamError,
+                message: "Invalid QPACK instruction",
+                cause: error,
+                errorCode: .qpackDecoderStreamError,
+                location: .here()
+            )
+            self.qpackCoder.incomingDecoderInstructionStreamFailed(h3Error)
         }
     }
 }

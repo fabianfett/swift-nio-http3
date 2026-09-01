@@ -24,7 +24,7 @@ import NIOQUICHelpers
 final class HTTP3ConnectionCoordinator<QUICStreamCreator: NIOQUICHelpers.QUICStreamCreator> {
     let eventLoop: any EventLoop
 
-    private var qpackCoder: NIOQPACKCoder<QUICStreamCreator>?
+    private var qpackCoder: NIOQPACKCoder<QUICStreamCreator, HTTP3ConnectionCoordinator<QUICStreamCreator>>?
     private var connectionStateMachine: HTTP3ConnectionStateMachine
 
     private let outboundControlStreamHandler: HTTP3OutboundControlStreamHandler
@@ -37,7 +37,7 @@ final class HTTP3ConnectionCoordinator<QUICStreamCreator: NIOQUICHelpers.QUICStr
     private let preferHuffmanEncoding: Bool
     private let logger: Logger
     /// Instances of stream handlers which need to be pinged whenever a dynamic table entry is added.
-    private var streamHandlers = [QUICStreamID: HTTP3StreamHandler<HTTP3ConnectionCoordinator<QUICStreamCreator>, NIOQPACKCoder<QUICStreamCreator>>]()
+    private var streamHandlers = [QUICStreamID: HTTP3StreamHandler<HTTP3ConnectionCoordinator<QUICStreamCreator>, QUICStreamCreator>]()
     private var datagramBuffer: HTTP3DatagramBuffer
 
     init(
@@ -59,7 +59,7 @@ final class HTTP3ConnectionCoordinator<QUICStreamCreator: NIOQUICHelpers.QUICStr
         self.preferHuffmanEncoding = preferHuffmanEncoding
         self.datagramBuffer = HTTP3DatagramBuffer(maxAllowedSize: maxBufferedDatagramBytes)
 
-        self.qpackCoder = NIOQPACKCoder<QUICStreamCreator>(
+        self.qpackCoder = NIOQPACKCoder<QUICStreamCreator, HTTP3ConnectionCoordinator<QUICStreamCreator>>(
             decoderMaxTableSize: Int(localSettings.qpackMaximumTableCapacity),
             decoderMaxBlockedStreams: Int(localSettings.qpackBlockedStreams),
             errorDelegate: self
@@ -474,8 +474,8 @@ final class HTTP3ConnectionCoordinator<QUICStreamCreator: NIOQUICHelpers.QUICStr
         let action = self.connectionStateMachine.inboundQPACKEncoderStreamReceived(streamID: streamID)
         switch action {
         case .addHandlers:
-            let handler = QPACKInboundEncoderStreamHandler(qpackCoder: self.qpackCoder)
-            streamChannel.pipeline.syncOperations.addHandler(handler)
+            let handler = QPACKInboundEncoderStreamHandler<QUICStreamCreator, HTTP3ConnectionCoordinator<QUICStreamCreator>>(qpackCoder: self.qpackCoder!)
+            try streamChannel.pipeline.syncOperations.addHandler(handler)
             try self.addStreamClosedHandler(
                 streamChannel: streamChannel,
                 streamID: streamID,
@@ -505,9 +505,8 @@ final class HTTP3ConnectionCoordinator<QUICStreamCreator: NIOQUICHelpers.QUICStr
         let action = self.connectionStateMachine.inboundQPACKDecoderStreamReceived(streamID: streamID)
         switch action {
         case .addHandlers:
-            let handler = QPACKInboundDecoderStreamHandler(qpackCoder: self.qpackCoder)
-            streamChannel.pipeline.syncOperations.addHandler(handler)
-
+            let handler = QPACKInboundDecoderStreamHandler<QUICStreamCreator, HTTP3ConnectionCoordinator<QUICStreamCreator>>(qpackCoder: self.qpackCoder!)
+            try streamChannel.pipeline.syncOperations.addHandler(handler)
             try self.addStreamClosedHandler(
                 streamChannel: streamChannel,
                 streamID: streamID,
@@ -555,11 +554,10 @@ final class HTTP3ConnectionCoordinator<QUICStreamCreator: NIOQUICHelpers.QUICStr
                 )
             }
             if onSettings.emitDatagramsNegotiatedEvent {
-                self.connection?.fireDatagramsNegotiatedEvent()
+//                self.connection?.fireDatagramsNegotiatedEvent()
             }
-            self.qpackCoder!.receivedRemoteSettings(
-                maxQueueSize: fra,
-                effectiveDynamicTableSize: <#T##Int#>
+            self.connection?.fireReceivedSettingsEvent(
+                ReceivedSettings(datagramsSupported: onSettings.datagramsNegotiated)
             )
         case .cancelStreams(let ids):
             self.cancelStreamsDueToReceivingGoaway(ids)
@@ -599,7 +597,7 @@ final class HTTP3ConnectionCoordinator<QUICStreamCreator: NIOQUICHelpers.QUICStr
         var logger = self.logger
         logger[metadataKey: LoggingKeys.h3StreamType] = "\(streamType)"
         logger[metadataKey: LoggingKeys.quicStreamID] = "\(streamID)"
-        let streamHandler = HTTP3StreamHandler(
+        let streamHandler = HTTP3StreamHandler<HTTP3ConnectionCoordinator<QUICStreamCreator>, QUICStreamCreator>(
             stateMachine: .init(
                 streamType: streamType,
                 incoming: incoming,
@@ -607,6 +605,7 @@ final class HTTP3ConnectionCoordinator<QUICStreamCreator: NIOQUICHelpers.QUICStr
             ),
             streamID: streamID,
             streamType: streamType,
+            qpackCoder: self.qpackCoder!,
             delegate: self,
             logger: logger
         )

@@ -41,13 +41,13 @@ struct FieldSectionQueue<Context> {
             prefix: FieldSectionPrefix,
             lines: [FieldLine],
             streamID: QUICStreamID,
-            receiver: Context
+            context: Context
         ) {
             self.headers = headers
             self.prefix = prefix
             self.lines = lines
             self.streamID = streamID
-            self.context = receiver
+            self.context = context
         }
 
         static func < (lhs: Entry, rhs: Entry) -> Bool {

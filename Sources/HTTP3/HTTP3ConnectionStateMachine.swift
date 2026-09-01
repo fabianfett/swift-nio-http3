@@ -660,6 +660,10 @@ public struct HTTP3ConnectionStateMachine: ~Copyable {
         public struct OnSettings: Hashable, Sendable {
             /// Tell the user that both peers have agreed to use HTTP datagrams.
             public var emitDatagramsNegotiatedEvent: Bool
+            /// Whether both peers have agreed to use HTTP datagrams. The outcome must be reported downstream.
+            public var datagramsNegotiated: Bool
+            /// An outbound QPACK encoder instruction stream needs to be created.
+            public var makeEncoderInstructionStream: Bool
         }
     }
 
@@ -675,7 +679,9 @@ public struct HTTP3ConnectionStateMachine: ~Copyable {
                 self = .init(state: .initialized(initializedState))
                 return .onSettings(
                     ControlFrameReceivedAction.OnSettings(
-                        emitDatagramsNegotiatedEvent: datagramsNegotiated
+                        emitDatagramsNegotiatedEvent: datagramsNegotiated,
+                        datagramsNegotiated: datagramsNegotiated,
+                        makeEncoderInstructionStream: true
                     )
                 )
             case .notStarted:
