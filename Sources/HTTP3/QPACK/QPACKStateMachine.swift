@@ -278,16 +278,40 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
         }
     }
 
+    /// Whether the connection that owns this QPACK state is still running.
+    private enum State {
+        case active
+        /// The connection has been shut down.
+        ///
+        /// There is nobody left to send instructions to and nobody left to receive decode results, so
+        /// every inbound instruction is dropped and no further actions are produced.
+        case finished
+    }
+
+    private var state: State
     private var encoderState: EncoderStateMachine
     private var qpackDecoder: QPACKDecoder
     private var decoderQueue: FieldSectionQueue<DecodeContext>
     private var outboundDecoderInstructionQueue: OutboundDecoderInstructionQueue
 
     init(decoderMaxTableSize: Int, decoderMaxBlockedStreams: Int) {
+        self.state = .active
         self.encoderState = .init()
         self.qpackDecoder = .init(dynamicTableMaxCapacity: decoderMaxTableSize)
         self.decoderQueue = .init(maxItems: decoderMaxBlockedStreams)
         self.outboundDecoderInstructionQueue = .init()
+    }
+
+    /// Call this when the connection has been shut down, so that the state machine stops acting on
+    /// anything that arrives afterwards.
+    ///
+    /// Any decodes that are still blocked are dropped: the streams waiting for them are gone, and holding
+    /// on to their decode contexts would keep them alive.
+    ///
+    /// It is safe to call this more than once.
+    mutating func shutdown() {
+        self.state = .finished
+        self.decoderQueue.removeAll()
     }
 
     enum GotRemoteSettingsAction {
@@ -299,7 +323,8 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
         maxQueueSize: Int,
         effectiveDynamicTableSize: Int
     ) -> GotRemoteSettingsAction? {
-        self.encoderState.receivedRemoteSettings(
+        guard case .active = self.state else { return nil }
+        return self.encoderState.receivedRemoteSettings(
             maxQueueSize: maxQueueSize,
             effectiveDynamicTableSize: effectiveDynamicTableSize
         )
@@ -311,7 +336,10 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
 
     /// Call this when the outbound encoder stream is ready. It is an error to call this when not asked for (via ``GotRemoteSettingsAction``).
     /// It is also an error to call this twice.
-    mutating func outboundEncoderStreamReady() -> OutboundEncoderStreamReadyAction {
+    ///
+    /// Returns `nil` if the connection was shut down while the stream was being created.
+    mutating func outboundEncoderStreamReady() -> OutboundEncoderStreamReadyAction? {
+        guard case .active = self.state else { return nil }
         switch self.encoderState.outboundEncoderStreamReady() {
         case .sendEncoderInstruction(let instruction):
             return .sendEncoderInstruction(instruction)
@@ -323,6 +351,7 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
     }
 
     mutating func outboundDecoderStreamReady() -> OutboundDecoderStreamReadyAction? {
+        guard case .active = self.state else { return nil }
         switch self.outboundDecoderInstructionQueue.outboundDecoderStreamReady() {
         case .sendDecoderInstructions(let instructions):
             return .sendDecoderInstructions(instructions)
@@ -332,7 +361,12 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
     }
 
     mutating func encodeHeaders(_ headers: [HTTPField], forStream streamID: QUICStreamID) -> QPACKEncodeResult {
-        self.encoderState.encodeHeaders(headers, forStream: streamID)
+        guard case .active = self.state else {
+            // Every stream is closed by the time the connection is shut down, so there is nobody left
+            // to encode headers for.
+            fatalError("Tried to encode headers after the connection was shut down")
+        }
+        return self.encoderState.encodeHeaders(headers, forStream: streamID)
     }
 
     enum DecodeHeaderAction {
@@ -382,6 +416,9 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
         forStream streamID: QUICStreamID,
         receiver: DecodeContext
     ) -> DecodeHeaderAction? {
+        // Drop it: the stream that asked for this is gone along with the connection.
+        guard case .active = self.state else { return nil }
+
         @inline(never)
         func invalidFieldSectionPrefixError(location: HTTP3Error.SourceLocation) -> HTTP3Error {
             HTTP3Error(
@@ -422,7 +459,13 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
         case .missingInsertCount:
             do {
                 try self.decoderQueue.add(
-                    .init(headers: headers, prefix: prefix, lines: headers.fieldSection.lines, streamID: streamID, context: receiver)
+                    .init(
+                        headers: headers,
+                        prefix: prefix,
+                        lines: headers.fieldSection.lines,
+                        streamID: streamID,
+                        context: receiver
+                    )
                 )
                 return nil
             } catch {
@@ -458,6 +501,7 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
     /// Check if any previously-queued decode is now decodable.
     /// This function should be called repeatedly after new input (eg. new incoming instructions) until it returns nil
     mutating func checkPendingDecodes() -> DecodeHeaderAction? {
+        guard case .active = self.state else { return nil }
         guard let entry = self.decoderQueue.popIfDecodable(availableInsertCount: self.qpackDecoder.insertCount) else {
             return nil
         }
@@ -475,7 +519,10 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
             case .connection(let h3Error):
                 return .emitConnectionError(h3Error, entry.context)
             case .stream(let h3Error):
-                return .informDecodeError(.init(error: h3Error, headers: entry.headers, streamID: entry.streamID), entry.context)
+                return .informDecodeError(
+                    .init(error: h3Error, headers: entry.headers, streamID: entry.streamID),
+                    entry.context
+                )
             }
         case .success(let fields, let instruction):
             let writeAction = instruction.flatMap { self.outboundDecoderInstructionQueue.writeDecoderInstruction($0) }
@@ -551,6 +598,9 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
     mutating func receivedIncomingEncoderInstruction(
         _ instruction: QPACKEncoderInstruction
     ) -> IncomingEncoderInstructionAction? {
+        // Drop it, we already closed.
+        guard case .active = self.state else { return nil }
+
         @inline(never)
         func invalidEncoderInstructionError(
             cause: any Error,
@@ -573,6 +623,8 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
                 return .none
             }
         } catch {
+            // The encoder stream is broken, which kills the connection: stop acting on QPACK entirely.
+            self.shutdown()
             return .emitConnectionError(invalidEncoderInstructionError(cause: error, location: .here()))
         }
     }
@@ -584,8 +636,13 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
     mutating func receivedIncomingDecoderInstruction(
         _ instruction: QPACKDecoderInstruction
     ) -> IncomingDecoderInstructionAction? {
+        // Drop it, we already closed.
+        guard case .active = self.state else { return nil }
+
         switch self.encoderState.receivedIncomingDecoderInstruction(instruction) {
         case .emitConnectionError(let e):
+            // The decoder stream is broken, which kills the connection: stop acting on QPACK entirely.
+            self.shutdown()
             return .emitConnectionError(e)
         case .none:
             return .none
@@ -606,6 +663,9 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
     ///     See RFC 9204 § 2.2.2.2 for more info.
     /// - Returns: Actions to take next.
     mutating func requestStreamClosed(streamID: QUICStreamID, seenEOF: Bool) -> RequestStreamClosedAction? {
+        // There is no point telling the remote about a cancelled stream on a connection that is gone.
+        guard case .active = self.state else { return nil }
+
         if seenEOF {
             // We currently don't need to do anything for cleanly-closed streams
             return nil

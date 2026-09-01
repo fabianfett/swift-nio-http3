@@ -6,10 +6,10 @@
 //
 
 @_spi(PackageInternal) import HTTP3
-@_spi(PackageInternal) import QPACK
+import HTTPTypes
 import NIOCore
 import NIOQUICHelpers
-import HTTPTypes
+@_spi(PackageInternal) import QPACK
 
 struct OutboundQPACKEncoderChannel: HTTP3.QPACKOutboundEncoderStream, ~Copyable {
     let encoder: QPACKEncoderInstructionEncoder
@@ -63,9 +63,12 @@ struct OutboundQPACKDecoderChannel: HTTP3.QPACKOutboundDecoderStream, ~Copyable 
     }
 }
 
-typealias NIOQPACKCoder<QUICStreamCreator: NIOQUICHelpers.QUICStreamCreator, StreamDelegate: HTTP3StreamDelegate> = HTTP3.QPACKCoder<
+typealias NIOQPACKCoder<
+    ConnectionDelegate: HTTP3.ConnectionDelegate,
+    StreamDelegate: HTTP3StreamDelegate
+> = HTTP3.QPACKCoder<
     OutboundQPACKEncoderChannel,
     OutboundQPACKDecoderChannel,
-    HTTP3ConnectionCoordinator<QUICStreamCreator>,
-    HTTP3StreamHandler<StreamDelegate, QUICStreamCreator>
+    ConnectionDelegate,
+    HTTP3StreamHandler<StreamDelegate, ConnectionDelegate>
 >

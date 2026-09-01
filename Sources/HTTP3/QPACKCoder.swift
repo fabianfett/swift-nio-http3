@@ -111,13 +111,15 @@ public final class QPACKCoder<
 
     @_spi(PackageInternal)
     public func outboundEncoderStreamReady(_ stream: consuming OutboundEncoderStream) {
-        self.outboundEncoderStream = consume stream
-
-        let action = self.stateMachine.outboundEncoderStreamReady()
-        switch action {
+        switch self.stateMachine.outboundEncoderStreamReady() {
         case .sendEncoderInstruction(let instruction):
+            self.outboundEncoderStream = consume stream
             guard let instruction else { break }
             self.outboundEncoderStream!.sendInstructions(CollectionOfOne(instruction))
+        case .none:
+            // The connection was shut down while this stream was being created. Drop it: we will never
+            // write anything on it.
+            break
         }
     }
 
@@ -211,5 +213,21 @@ public final class QPACKCoder<
         case .none:
             break
         }
+    }
+
+    // MARK: Shutdown
+
+    /// Call this when the connection has been shut down.
+    ///
+    /// Afterwards every inbound QPACK instruction is dropped and no further instructions are written:
+    /// the peer is gone, and so are the streams that were waiting on blocked decodes.
+    ///
+    /// It is safe to call this more than once.
+    @_spi(PackageInternal)
+    public func shutdownConnection() {
+        self.stateMachine.shutdown()
+        // Nothing more will be written on these, so let go of the channels behind them.
+        self.outboundEncoderStream = nil
+        self.outboundDecoderStream = nil
     }
 }

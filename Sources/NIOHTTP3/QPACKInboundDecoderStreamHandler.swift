@@ -12,28 +12,39 @@
 //
 //===----------------------------------------------------------------------===//
 
-import NIOCore
-@_spi(PackageInternal) import QPACK
 @_spi(PackageInternal) import HTTP3
+import NIOCore
 import NIOQUICHelpers
+@_spi(PackageInternal) import QPACK
 
 /// Read decoder instructions from a channel and give them to a callback.
 /// This belongs on the incoming decoder stream.
 /// The decoder instructions come from the remote decoder and should be fed into the local encoder.
-final class QPACKInboundDecoderStreamHandler<QUICStreamCreator: NIOQUICHelpers.QUICStreamCreator, StreamDelegate: HTTP3StreamDelegate>: ChannelInboundHandler {
+final class QPACKInboundDecoderStreamHandler<
+    ConnectionDelegate: HTTP3.ConnectionDelegate,
+    StreamDelegate: HTTP3StreamDelegate
+>: ChannelInboundHandler {
     typealias InboundIn = ByteBuffer
 
-    private let qpackCoder: NIOQPACKCoder<QUICStreamCreator, StreamDelegate>
+    private let qpackCoder: NIOQPACKCoder<ConnectionDelegate, StreamDelegate>
     private var decoder: NIOSingleStepByteToMessageProcessor<QPACKDecoderInstructionDecoder>
 
-    init(qpackCoder: NIOQPACKCoder<QUICStreamCreator, StreamDelegate>) {
+    init(qpackCoder: NIOQPACKCoder<ConnectionDelegate, StreamDelegate>) {
         self.qpackCoder = qpackCoder
         self.decoder = NIOSingleStepByteToMessageProcessor(QPACKDecoderInstructionDecoder())
     }
 
-    func errorCaught(context: ChannelHandlerContext, error: HTTP3Error) {
-        self.qpackCoder.incomingDecoderInstructionStreamFailed(error)
-        context.fireErrorCaught(error)
+    func errorCaught(context: ChannelHandlerContext, error: any Error) {
+        let h3Error = HTTP3Error(
+            code: .qpackDecoderStreamError,
+            message: "Invalid QPACK instruction",
+            cause: error,
+            errorCode: .qpackDecoderStreamError,
+            location: .here()
+        )
+
+        self.qpackCoder.incomingDecoderInstructionStreamFailed(h3Error)
+        context.fireErrorCaught(h3Error)
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {

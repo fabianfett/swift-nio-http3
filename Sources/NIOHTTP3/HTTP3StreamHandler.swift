@@ -33,23 +33,12 @@ protocol HTTP3StreamDelegate {
     func onConnectionError(_ error: HTTP3Error)
 }
 
-protocol QPACKCoder {
-    associatedtype Receiver: HTTP3.QPACKDecodeReceiver
-
-    /// Ask the connection coordinator to encode some fields into a partial header.
-    /// It will handle sending any necessary instructions to the remote, on the dedicated QPACK stream.
-    func encodeHeaders(_: [HTTPField], forStream streamID: QUICStreamID) -> HTTP3PartialFrame.Headers
-
-    /// Tell the connection coordinator that we want to decode a header. It will handle queueing and call back into us when it has a result.
-    func decodeHeaders(_ headers: HTTP3PartialFrame.Headers, forStream streamID: QUICStreamID, decodeReceiver: Receiver)
-}
-
 /// This handler should be added to every incoming and outgoing HTTP/3 stream which carries HTTP frames.
 /// It handles encoding and decoding of these frames.
 /// It will only pass through valid frames, and handles things such as QPACK header decoding.
 final class HTTP3StreamHandler<
     Delegate: HTTP3StreamDelegate,
-    QUICStreamCreator: NIOQUICHelpers.QUICStreamCreator
+    ConnectionDelegate: HTTP3.ConnectionDelegate
 >: ChannelDuplexHandler {
     typealias InboundIn = ByteBuffer
     typealias InboundOut = HTTP3Frame
@@ -61,7 +50,7 @@ final class HTTP3StreamHandler<
     private let streamType: HTTP3StreamType.Framed
 
     private let delegate: Delegate
-    private let qpackCoder: NIOQPACKCoder<QUICStreamCreator, Delegate>
+    private let qpackCoder: NIOQPACKCoder<ConnectionDelegate, Delegate>
 
     /// The channel context. This handler can only be in one channel at a time.
     private var context: ChannelHandlerContext?
@@ -75,13 +64,29 @@ final class HTTP3StreamHandler<
     /// The state machine which handles processing incoming bytes into frames, including validating them and decoding QPACK.
     private var stateMachine: HTTP3StreamStateMachine
 
+    /// Whether ``deliverFrames(context:completingRead:)`` is currently reading frames out of the state machine.
+    ///
+    /// Asking the QPACK coder to decode a header can complete synchronously, which calls straight back
+    /// into ``onQPACKDecodeResult(fields:)`` and from there into ``deliverFrames(context:completingRead:)``
+    /// again, while the outer loop is still running. This flag lets the re-entrant call bow out: the loop
+    /// it would duplicate is still going, and will pick up the newly unblocked frames on its next
+    /// iteration.
+    private var isDeliveringFrames = false
+
+    /// Whether frames have been fired downstream which no read-complete has followed yet.
+    ///
+    /// Frames go out as their bytes arrive, so a read burst can end without producing any, and a QPACK
+    /// decode can produce some long after the burst that carried them. This tracks which of the two owes
+    /// downstream a read-complete.
+    private var didFireChannelRead = false
+
     private let logger: Logger
 
     init(
         stateMachine: consuming HTTP3StreamStateMachine,
         streamID: QUICStreamID,
         streamType: HTTP3StreamType.Framed,
-        qpackCoder: NIOQPACKCoder<QUICStreamCreator, Delegate>,
+        qpackCoder: NIOQPACKCoder<ConnectionDelegate, Delegate>,
         delegate: Delegate,
         logger: Logger
     ) {
@@ -130,7 +135,6 @@ final class HTTP3StreamHandler<
         switch closeAction {
         case .streamClosed(let seenEOF):
             // unbuffer our read actions
-            var didFireChannelRead = false
             loop: for action in actionBuffer {
                 switch action {
                 case .inputClosed(let inputClosedAction):
@@ -150,7 +154,7 @@ final class HTTP3StreamHandler<
                     }
                 case .returnFrame(let frame):
                     context.fireChannelRead(wrapInboundOut(frame))
-                    didFireChannelRead = true
+                    self.didFireChannelRead = true
                 case .decodeHeader:
                     // No point waiting for qpack decodes, the channel won't be around by the time we get a result
                     // Then we have to break the whole loop: can't allow further actions to overtake
@@ -164,9 +168,9 @@ final class HTTP3StreamHandler<
                     fatalError("Action shouldn't have been buffered")
                 }
             }
-            if didFireChannelRead {
-                context.fireChannelReadComplete()
-            }
+            // Anything we fired here, plus anything fired by an earlier read that no read-complete has
+            // followed yet, has to be completed before channel inactive goes downstream.
+            self.completeReadIfNeeded(context: context)
             self.delegate.onStreamClosed(seenEOF, streamID: self.streamID, streamType: self.streamType)
         }
         // Cleanup reference to avoid leaks.
@@ -186,14 +190,43 @@ final class HTTP3StreamHandler<
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let bytes = self.unwrapInboundIn(data)
         self.logger.trace("HTTP3StreamHandler.channelRead", metadata: [LoggingKeys.bytes: "\(bytes.readableBytes)"])
+        // Hand the bytes to the state machine and forward whatever frames that completes right away,
+        // rather than holding everything until the read burst ends.
         self.stateMachine.buffer(bytes)
+        self.deliverFrames(context: context, completingRead: false)
     }
 
     func channelReadComplete(context: ChannelHandlerContext) {
         self.logger.trace("HTTP3StreamHandler.channelReadComplete")
-        // In channelRead, we buffer bytes into the state machine.
-        // Now it's time to try and read out as many full frames as possible.
-        var didFireChannelRead = false
+        // The frames went out as the bytes arrived, so there is nothing to decode here: just close off
+        // the burst. If nothing came out of it, because every frame in it is still waiting on a QPACK
+        // decode, we stay quiet and let the decode fire the read-complete when it lands.
+        self.completeReadIfNeeded(context: context)
+    }
+
+    /// Fire a read-complete, if frames have gone downstream that aren't covered by one yet.
+    private func completeReadIfNeeded(context: ChannelHandlerContext) {
+        guard self.didFireChannelRead else { return }
+        self.didFireChannelRead = false
+        context.fireChannelReadComplete()
+    }
+
+    /// Read as many frames as the state machine can give us out of the bytes it has buffered, and fire
+    /// them downstream.
+    ///
+    /// - Parameters:
+    ///   - context: The context to fire the frames on.
+    ///   - completingRead: Whether to finish the read burst with a read-complete once no more frames are
+    ///     available. This is what frames that arrive outside a read want, i.e. those that a late QPACK
+    ///     decode unblocks: there is no `channelReadComplete` coming for them.
+    private func deliverFrames(context: ChannelHandlerContext, completingRead: Bool) {
+        // A synchronous QPACK decode result re-enters us from inside the loop below. Bow out: the loop is
+        // still running and will read out the frames the decode just unblocked. Carrying on here would
+        // deliver frames out of order and fire a second read-complete for a single read burst.
+        guard !self.isDeliveringFrames else { return }
+        self.isDeliveringFrames = true
+        defer { self.isDeliveringFrames = false }
+
         decodeLoop: while true {
             let action = self.stateMachine.decodeNext()
             switch action {
@@ -224,9 +257,14 @@ final class HTTP3StreamHandler<
                     metadata: [LoggingKeys.h3FrameType: "\(frame.type)"]
                 )
                 context.fireChannelRead(wrapInboundOut(frame))
-                didFireChannelRead = true
+                self.didFireChannelRead = true
             case .decodeHeader(let partialHeader):
                 self.logger.trace("HTTP3StreamHandler waiting for QPACK decode")
+                // This call may re-enter us: if the coder can decode the header right away (which is the
+                // common case, and always the case when the peer doesn't use the dynamic table) it calls
+                // `decodeResult(_:)` before returning, which feeds the result back into the state machine.
+                // We deliberately don't handle the result here. Either way, the next iteration of this
+                // loop picks up whatever became available.
                 self.qpackCoder.decodeHeaders(partialHeader, forStream: self.streamID, decodeReceiver: self)
             case .emitStreamError(let error):
                 context.triggerUserOutboundEvent(
@@ -238,9 +276,9 @@ final class HTTP3StreamHandler<
                 self.delegate.onConnectionError(error)
             }
         }
-        // If we didn't read anything in this loop then we should also not fire the read complete
-        if didFireChannelRead {
-            context.fireChannelReadComplete()
+
+        if completingRead {
+            self.completeReadIfNeeded(context: context)
         }
     }
 
@@ -373,8 +411,10 @@ final class HTTP3StreamHandler<
             fatalError("Tried to deliver QPACK results before handler was added")
         }
         self.stateMachine.gotHeaderDecodeResult(fields)
-        // Call self.channelReadComplete which will decode and fire reads as much as possible before firing a read complete
-        self.channelReadComplete(context: context)
+        // Read out as much as this unblocked, and close off the burst: no `channelReadComplete` is coming
+        // for frames delivered this late. If the decode completed synchronously we are being called from
+        // within that very loop, in which case this is a no-op and the loop we are nested inside reads.
+        self.deliverFrames(context: context, completingRead: true)
     }
 
     /// Call this if an error is encountered whilst trying to decode `header`.
@@ -386,8 +426,8 @@ final class HTTP3StreamHandler<
             fatalError("Tried to deliver QPACK error before handler was set")
         }
         self.stateMachine.gotHeaderDecodeError(error)
-        // Call self.channelReadComplete which will decode and fire reads as much as possible before firing a read complete
-        self.channelReadComplete(context: context)
+        // As in `onQPACKDecodeResult`, this is a no-op when the coder failed the decode synchronously.
+        self.deliverFrames(context: context, completingRead: true)
     }
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
@@ -395,6 +435,8 @@ final class HTTP3StreamHandler<
             // We don't pass this through immediately, we buffer it behind any buffered reads to prevent overtaking.
             self.logger.trace("HTTP3StreamHandler intercepted inputClosed")
             self.stateMachine.inputClosed()
+            // The state machine hands the event back out once everything queued ahead of it has been read.
+            self.deliverFrames(context: context, completingRead: false)
         } else {
             // Pass it through
             context.fireUserInboundEventTriggered(event)
@@ -487,6 +529,11 @@ final class HTTP3StreamHandler<
 extension HTTP3StreamHandler: Sendable {}
 
 extension HTTP3StreamHandler: QPACKDecodeReceiver {
+    /// The QPACK coder calls this with the outcome of a decode we asked for.
+    ///
+    /// This is called either synchronously from inside our own call to `decodeHeaders`, when the coder
+    /// had everything it needed, or later on, from whichever QPACK encoder-stream instruction unblocked
+    /// the decode. Both paths must work; see `isDrainingFrames`.
     func decodeResult(_ result: Result<[HTTPTypes.HTTPField], HTTP3Error>) {
         switch result {
         case .success(let fields):

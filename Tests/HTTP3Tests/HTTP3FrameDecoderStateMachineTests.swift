@@ -107,6 +107,30 @@ struct HTTP3FrameDecoderStateMachineTests {
         #expect(action3.returnFrame == .data(.init(bytes: self.testDataFrameContent)))
     }
 
+    /// An unknown frame whose payload doesn't all arrive at once must not spin: the decoder skips what it
+    /// has and asks for more, rather than looping on an empty buffer.
+    @Test
+    func testUnknownFrameTypeWithSplitPayload() {
+        // Type 12 is not a known type, and it declares a four byte payload.
+        var decoder = HTTP3FrameDecoderStateMachine()
+        decoder.buffer(.init(bytes: [12, 4] as [UInt8]))
+
+        #expect(decoder.decodeNext().isReturnUnknownFrame)
+        // The payload hasn't arrived, so there is nothing more to do yet.
+        #expect(decoder.decodeNext().needsMoreBytes)
+
+        // The payload arrives split in two, and neither half is enough to finish the skip.
+        decoder.buffer(.init(bytes: [0xde, 0xad] as [UInt8]))
+        #expect(decoder.decodeNext().needsMoreBytes)
+
+        decoder.buffer(.init(bytes: [0xbe, 0xef] as [UInt8]))
+        #expect(decoder.decodeNext().needsMoreBytes)
+
+        // Once the unknown frame has been skipped over, the frame behind it decodes as usual.
+        decoder.buffer(.init(bytes: self.testDataFrameBytes))
+        #expect(decoder.decodeNext().returnFrame == .data(.init(bytes: self.testDataFrameContent)))
+    }
+
     @Test
     func testForbiddenFrameType() {
         let forbiddenTypes: [UInt8] = [2, 6, 8, 9]

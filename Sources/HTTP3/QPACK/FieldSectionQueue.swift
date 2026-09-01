@@ -96,6 +96,11 @@ struct FieldSectionQueue<Context> {
         self.entries = .init(self.entries.unordered.filter { $0.streamID != streamID })
     }
 
+    /// Remove every entry in the queue.
+    mutating func removeAll() {
+        self.entries = .init()
+    }
+
     /// - Parameter maxItems: The maximum number of items that may be in the queue at any one time.
     init(maxItems: Int) {
         self.maxItems = maxItems

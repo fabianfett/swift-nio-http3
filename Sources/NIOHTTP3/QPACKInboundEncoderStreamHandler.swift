@@ -12,21 +12,24 @@
 //
 //===----------------------------------------------------------------------===//
 
-import NIOCore
-@_spi(PackageInternal) import QPACK
 @_spi(PackageInternal) import HTTP3
+import NIOCore
 import NIOQUICHelpers
+@_spi(PackageInternal) import QPACK
 
 /// Read encoder instructions from a channel and give them to a callback.
 /// This belongs on the incoming encoder stream.
 /// The encoder instructions come from the remote encoder and should be fed into the local decoder.
-final class QPACKInboundEncoderStreamHandler<QUICStreamCreator: NIOQUICHelpers.QUICStreamCreator, StreamDelegate: HTTP3StreamDelegate>: ChannelInboundHandler {
+final class QPACKInboundEncoderStreamHandler<
+    ConnectionDelegate: HTTP3.ConnectionDelegate,
+    StreamDelegate: HTTP3StreamDelegate
+>: ChannelInboundHandler {
     typealias InboundIn = ByteBuffer
 
-    private let qpackCoder: NIOQPACKCoder<QUICStreamCreator, StreamDelegate>
+    private let qpackCoder: NIOQPACKCoder<ConnectionDelegate, StreamDelegate>
     private var decoder: NIOSingleStepByteToMessageProcessor<QPACKEncoderInstructionDecoder>
 
-    init(qpackCoder: NIOQPACKCoder<QUICStreamCreator, StreamDelegate>) {
+    init(qpackCoder: NIOQPACKCoder<ConnectionDelegate, StreamDelegate>) {
         self.qpackCoder = qpackCoder
         self.decoder = NIOSingleStepByteToMessageProcessor(QPACKEncoderInstructionDecoder())
     }

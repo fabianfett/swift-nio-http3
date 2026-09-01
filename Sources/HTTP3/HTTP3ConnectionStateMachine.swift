@@ -662,8 +662,6 @@ public struct HTTP3ConnectionStateMachine: ~Copyable {
             public var emitDatagramsNegotiatedEvent: Bool
             /// Whether both peers have agreed to use HTTP datagrams. The outcome must be reported downstream.
             public var datagramsNegotiated: Bool
-            /// An outbound QPACK encoder instruction stream needs to be created.
-            public var makeEncoderInstructionStream: Bool
         }
     }
 
@@ -680,8 +678,7 @@ public struct HTTP3ConnectionStateMachine: ~Copyable {
                 return .onSettings(
                     ControlFrameReceivedAction.OnSettings(
                         emitDatagramsNegotiatedEvent: datagramsNegotiated,
-                        datagramsNegotiated: datagramsNegotiated,
-                        makeEncoderInstructionStream: true
+                        datagramsNegotiated: datagramsNegotiated
                     )
                 )
             case .notStarted:

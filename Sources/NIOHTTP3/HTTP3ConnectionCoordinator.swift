@@ -22,9 +22,14 @@ import NIOQUICHelpers
 /// This class owns the connection state machine and is responsible for opening streams and sending frames.
 /// I.e. it coordinates everything across the connection, including qpack.
 final class HTTP3ConnectionCoordinator<QUICStreamCreator: NIOQUICHelpers.QUICStreamCreator> {
+    /// The QPACK coder used by all streams of this connection. The coordinator is both the QPACK
+    /// connection delegate and the stream delegate of every stream handler.
+    typealias QPACKCoder = NIOQPACKCoder<HTTP3ConnectionCoordinator, HTTP3ConnectionCoordinator>
+    typealias StreamHandler = HTTP3StreamHandler<HTTP3ConnectionCoordinator, HTTP3ConnectionCoordinator>
+
     let eventLoop: any EventLoop
 
-    private var qpackCoder: NIOQPACKCoder<QUICStreamCreator, HTTP3ConnectionCoordinator<QUICStreamCreator>>?
+    private var qpackCoder: QPACKCoder?
     private var connectionStateMachine: HTTP3ConnectionStateMachine
 
     private let outboundControlStreamHandler: HTTP3OutboundControlStreamHandler
@@ -37,7 +42,7 @@ final class HTTP3ConnectionCoordinator<QUICStreamCreator: NIOQUICHelpers.QUICStr
     private let preferHuffmanEncoding: Bool
     private let logger: Logger
     /// Instances of stream handlers which need to be pinged whenever a dynamic table entry is added.
-    private var streamHandlers = [QUICStreamID: HTTP3StreamHandler<HTTP3ConnectionCoordinator<QUICStreamCreator>, QUICStreamCreator>]()
+    private var streamHandlers = [QUICStreamID: StreamHandler]()
     private var datagramBuffer: HTTP3DatagramBuffer
 
     init(
@@ -59,7 +64,7 @@ final class HTTP3ConnectionCoordinator<QUICStreamCreator: NIOQUICHelpers.QUICStr
         self.preferHuffmanEncoding = preferHuffmanEncoding
         self.datagramBuffer = HTTP3DatagramBuffer(maxAllowedSize: maxBufferedDatagramBytes)
 
-        self.qpackCoder = NIOQPACKCoder<QUICStreamCreator, HTTP3ConnectionCoordinator<QUICStreamCreator>>(
+        self.qpackCoder = QPACKCoder(
             decoderMaxTableSize: Int(localSettings.qpackMaximumTableCapacity),
             decoderMaxBlockedStreams: Int(localSettings.qpackBlockedStreams),
             errorDelegate: self
@@ -474,7 +479,9 @@ final class HTTP3ConnectionCoordinator<QUICStreamCreator: NIOQUICHelpers.QUICStr
         let action = self.connectionStateMachine.inboundQPACKEncoderStreamReceived(streamID: streamID)
         switch action {
         case .addHandlers:
-            let handler = QPACKInboundEncoderStreamHandler<QUICStreamCreator, HTTP3ConnectionCoordinator<QUICStreamCreator>>(qpackCoder: self.qpackCoder!)
+            let handler = QPACKInboundEncoderStreamHandler<HTTP3ConnectionCoordinator, HTTP3ConnectionCoordinator>(
+                qpackCoder: self.qpackCoder!
+            )
             try streamChannel.pipeline.syncOperations.addHandler(handler)
             try self.addStreamClosedHandler(
                 streamChannel: streamChannel,
@@ -505,7 +512,9 @@ final class HTTP3ConnectionCoordinator<QUICStreamCreator: NIOQUICHelpers.QUICStr
         let action = self.connectionStateMachine.inboundQPACKDecoderStreamReceived(streamID: streamID)
         switch action {
         case .addHandlers:
-            let handler = QPACKInboundDecoderStreamHandler<QUICStreamCreator, HTTP3ConnectionCoordinator<QUICStreamCreator>>(qpackCoder: self.qpackCoder!)
+            let handler = QPACKInboundDecoderStreamHandler<HTTP3ConnectionCoordinator, HTTP3ConnectionCoordinator>(
+                qpackCoder: self.qpackCoder!
+            )
             try streamChannel.pipeline.syncOperations.addHandler(handler)
             try self.addStreamClosedHandler(
                 streamChannel: streamChannel,
@@ -554,7 +563,7 @@ final class HTTP3ConnectionCoordinator<QUICStreamCreator: NIOQUICHelpers.QUICStr
                 )
             }
             if onSettings.emitDatagramsNegotiatedEvent {
-//                self.connection?.fireDatagramsNegotiatedEvent()
+                //                self.connection?.fireDatagramsNegotiatedEvent()
             }
             self.connection?.fireReceivedSettingsEvent(
                 ReceivedSettings(datagramsSupported: onSettings.datagramsNegotiated)
@@ -597,7 +606,7 @@ final class HTTP3ConnectionCoordinator<QUICStreamCreator: NIOQUICHelpers.QUICStr
         var logger = self.logger
         logger[metadataKey: LoggingKeys.h3StreamType] = "\(streamType)"
         logger[metadataKey: LoggingKeys.quicStreamID] = "\(streamID)"
-        let streamHandler = HTTP3StreamHandler<HTTP3ConnectionCoordinator<QUICStreamCreator>, QUICStreamCreator>(
+        let streamHandler = StreamHandler(
             stateMachine: .init(
                 streamType: streamType,
                 incoming: incoming,
@@ -650,6 +659,9 @@ final class HTTP3ConnectionCoordinator<QUICStreamCreator: NIOQUICHelpers.QUICStr
         self.eventLoop.preconditionInEventLoop()
         self.logger.trace("Immediately closing connection")
         let action = self.connectionStateMachine.shutdownConnectionImmediately()
+        // The QPACK coder is reachable from the QPACK stream handlers, which outlive this call, so it
+        // has to be told about the shutdown itself: anything arriving from now on must be dropped.
+        self.qpackCoder?.shutdownConnection()
         switch action {
         case .shutdown:
             self.connection?.emitConnectionError(
@@ -800,7 +812,11 @@ extension Channel {
 }
 
 extension HTTP3ConnectionCoordinator: HTTP3StreamDelegate {
-    func onStreamClosed(_ sawEOF: Bool, streamID: NIOQUICHelpers.QUICStreamID, streamType: HTTP3.HTTP3StreamType.Framed) {
+    func onStreamClosed(
+        _ sawEOF: Bool,
+        streamID: NIOQUICHelpers.QUICStreamID,
+        streamType: HTTP3.HTTP3StreamType.Framed
+    ) {
         self.onStreamClosed(streamID: streamID, seenEOF: sawEOF, streamType: .init(streamType))
     }
 
