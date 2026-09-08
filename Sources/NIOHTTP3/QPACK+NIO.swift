@@ -14,7 +14,20 @@
 
 public import NIOCore
 @_spi(PackageInternal) public import QPACK
+@_spi(PackageInternal) import HTTP3
+import NIOQUICHelpers
 
 extension QPACKDecoderInstructionDecoder: NIOSingleStepByteToMessageDecoder {}
 @available(anyAppleOS 26.0, *)
 extension QPACKEncoderInstructionDecoder: NIOSingleStepByteToMessageDecoder {}
+
+@available(anyAppleOS 26.0, *)
+typealias NIOQPACKCoder<
+    ConnectionDelegate: HTTP3.QPACKConnectionDelegate,
+    StreamDelegate: HTTP3StreamDelegate
+> = HTTP3.QPACKCoder<
+    QPACKOutboundEncoderStream,
+    QPACKOutboundDecoderStream,
+    ConnectionDelegate,
+    HTTP3StreamHandler<StreamDelegate, ConnectionDelegate>
+>
