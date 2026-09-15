@@ -164,8 +164,8 @@ public final class QPACKCoder<
     /// table, or because this endpoint refuses to use one — no encoder stream is requested, since it would never
     /// be used. See RFC 9204 § 4.2.
     ///
-    /// The peer may only send SETTINGS once. Calling this a second time leaves the coder's state untouched and
-    /// reports an `H3_FRAME_UNEXPECTED` connection error to the ``ConnectionDelegate``.
+    /// - Important: The peer may only send SETTINGS once. Calling this a second time leaves the coder's state
+    ///   untouched and reports an `H3_FRAME_UNEXPECTED` connection error to the ``ConnectionDelegate``.
     ///
     /// - Parameters:
     ///   - maxQueueSize: The peer's `SETTINGS_QPACK_BLOCKED_STREAMS`.
