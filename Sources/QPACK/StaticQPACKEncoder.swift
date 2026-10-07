@@ -45,6 +45,36 @@ public struct StaticQPACKEncoder {
         FieldSectionPrefix(requiredInsertCount: 0, base: 0).encode(maxCapacity: 0)
     }
 
+    /// The number of bytes ``appendFieldSectionPrefix(into:)`` appends.
+    @_spi(PackageInternal)
+    public var fieldSectionPrefixLength: Int {
+        QPACKEncodedLength.fieldSectionPrefix(Self.staticPrefix)
+    }
+
+    /// Appends the prefix of a field section whose field lines are then appended one at a time with
+    /// ``append(_:into:preferHuffmanEncoding:)``, for callers which don't collect an `[HTTPField]` first.
+    ///
+    /// - Precondition: `output` has room for ``fieldSectionPrefixLength`` more bytes.
+    @_spi(PackageInternal)
+    public func appendFieldSectionPrefix(into output: inout OutputRawSpan) {
+        output.appendFieldSectionPrefix(Self.staticPrefix)
+    }
+
+    /// The largest number of bytes ``append(_:into:preferHuffmanEncoding:)`` appends for `header`.
+    @_spi(PackageInternal)
+    public func maxEncodedLength(of header: HTTPField) -> Int {
+        QPACKEncodedLength.maxFieldLine(header, indexLimit: StaticHeaderTable.raw.count)
+    }
+
+    /// Encodes `header` into a single field line, and appends it to `output`. The field section must start with
+    /// ``appendFieldSectionPrefix(into:)``.
+    ///
+    /// - Precondition: `output` has room for ``maxEncodedLength(of:)`` more bytes for `header`.
+    @_spi(PackageInternal)
+    public func append(_ header: HTTPField, into output: inout OutputRawSpan, preferHuffmanEncoding: Bool) {
+        output.appendFieldLine(self.fieldLine(for: header), preferHuffmanEncoding: preferHuffmanEncoding)
+    }
+
     /// Encodes a single field.
     func fieldLine(for header: HTTPField) -> FieldLine {
         let requireLiteralRepresentation: Bool
@@ -95,14 +125,20 @@ extension QPACKEncodedLength {
     /// The largest number of bytes the field lines encoding `headers` take, if every table index the encoder may
     /// reference is below `indexLimit`.
     static func maxFieldLines(_ headers: [HTTPField], indexLimit: Int) -> Int {
+        var length = 0
+        for header in headers {
+            length &+= Self.maxFieldLine(header, indexLimit: indexLimit)
+        }
+        return length
+    }
+
+    /// The largest number of bytes the field line encoding `header` takes, if every table index the encoder may
+    /// reference is below `indexLimit`.
+    static func maxFieldLine(_ header: HTTPField, indexLimit: Int) -> Int {
         // The smallest index prefix is 3 bits (RFC 9204 § 4.5.5). A name is an index or a string literal; a value, if
         // present, is a string literal.
         let maxIndex = Self.prefixedInteger(indexLimit, prefix: 3)
-        var length = 0
-        for header in headers {
-            let maxName = Self.maxString(byteCount: header.name.canonicalName.utf8.count, prefix: 4)
-            length &+= max(maxName, maxIndex) &+ Self.maxString(byteCount: header.value.utf8.count, prefix: 8)
-        }
-        return length
+        let maxName = Self.maxString(byteCount: header.name.canonicalName.utf8.count, prefix: 4)
+        return max(maxName, maxIndex) &+ Self.maxString(byteCount: header.value.utf8.count, prefix: 8)
     }
 }

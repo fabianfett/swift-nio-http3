@@ -248,3 +248,71 @@ public struct QPACKDecoder {
         prefix.decode(totalInserts: self.insertCount, maxCapacity: self.dynamicTable.maximumCapacity)
     }
 }
+
+/// Decodes field sections which reference the QPACK static table only, the counterpart of ``StaticQPACKEncoder``.
+///
+/// For endpoints which advertise a `SETTINGS_QPACK_MAX_TABLE_CAPACITY` of zero: a conformant peer can then neither
+/// insert into the dynamic table nor reference it. Any field section which does either is rejected with
+/// ``QPACKDecoderError/invalidReference`` or ``QPACKDecoderError/invalidFieldSection``.
+@available(anyAppleOS 27, *)
+@_spi(PackageInternal)
+public struct StaticQPACKDecoder: Sendable {
+    @_spi(PackageInternal)
+    public init() {}
+
+    /// Decodes the whole of `fieldSection`, an encoded field section: its prefix, followed by its field lines.
+    ///
+    /// The lines are read one at a time, so that no list of them is ever built.
+    @_spi(PackageInternal)
+    public func decodeFieldSection(_ fieldSection: borrowing RawSpan) throws(QPACKDecoderError) -> [HTTPField] {
+        // RFC 9204 § 4.5.1: with an empty dynamic table the only prefix a conformant encoder can produce is a
+        // zero Required Insert Count with a non-negative Base. A prefix which ends early, or holds an integer too
+        // large to represent, can't be decoded either.
+        guard let prefix = try? fieldSection.getFieldSectionPrefix(at: 0),
+            prefix.value.encodedRequiredInsertCount == 0,
+            !prefix.value.signBit
+        else {
+            throw QPACKDecoderError.invalidFieldSection
+        }
+        var fields = [HTTPField]()
+        fields.reserveCapacity(QPACKConstants.defaultFieldLinesCapacity)
+        var offset = prefix.bytesRead
+        while offset < fieldSection.byteCount {
+            // RFC 9204 § 6: a line which can't be read is a QPACK_DECOMPRESSION_FAILED connection error.
+            guard let line = try? fieldSection.getFieldLine(at: offset) else {
+                throw QPACKDecoderError.invalidFieldSection
+            }
+            // Advance before decoding: if `line` is still used after `decodeLine`, which throws a typed error, the
+            // compiler copies the line, strings and all, around the call. That costs about 20% of a decode.
+            offset &+= line.bytesRead
+            try fields.append(self.decodeLine(line.value))
+        }
+        return fields
+    }
+
+    private func decodeLine(_ line: FieldLine) throws(QPACKDecoderError) -> HTTPField {
+        switch line {
+        case .indexed(.staticTable, let index):
+            guard let entry = StaticHeaderTable.get(at: index) else {
+                throw QPACKDecoderError.invalidReference
+            }
+            return .init(name: entry.0, value: entry.1)
+        case .literal(_, let name, let value):
+            guard let fieldName = HTTPField.Name(parsed: name) else {
+                throw QPACKDecoderError.invalidHeaderName
+            }
+            return .init(name: fieldName, value: value)
+        case .literalWithNameReference(_, .staticTable, let index, let value):
+            guard let entry = StaticHeaderTable.get(at: index) else {
+                throw QPACKDecoderError.invalidReference
+            }
+            return .init(name: entry.0, value: value)
+        case .indexed(.dynamicTable, _),
+            .literalWithNameReference(_, .dynamicTable, _, _),
+            .indexedWithPostBase,
+            .literalWithNameReferenceWithPostBase:
+            // The dynamic table is always empty, so any reference to it is out of range.
+            throw QPACKDecoderError.invalidReference
+        }
+    }
+}
