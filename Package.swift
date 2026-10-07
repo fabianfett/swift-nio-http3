@@ -66,6 +66,21 @@ let package = Package(
             swiftSettings: swiftSettings
         ),
         .target(
+            name: "H3EchoServer",
+            dependencies: [
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "HTTPTypes", package: "swift-http-types"),
+                .product(name: "Logging", package: "swift-log"),
+                .product(name: "NIOQUICHelpers", package: "swift-nio-quic-helpers"),
+                .product(name: "NIOQUIC", package: "swift-nio-quic"),
+                .product(name: "NIOHTTPTypes", package: "swift-nio-extras"),
+                .target(name: "HTTP3"),
+                .target(name: "NIOHTTP3"),
+            ],
+            swiftSettings: swiftSettings
+        ),
+        .target(
             name: "QPACK",
             dependencies: [
                 .product(name: "NIOCore", package: "swift-nio"),
@@ -136,6 +151,7 @@ let package = Package(
                 .product(name: "HTTPTypes", package: "swift-http-types"),
                 .product(name: "X509", package: "swift-certificates"),
                 .product(name: "NIOQUIC", package: "swift-nio-quic"),
+                .target(name: "H3EchoServer"),
             ],
             swiftSettings: swiftSettings
         ),
