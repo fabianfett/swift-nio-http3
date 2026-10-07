@@ -31,6 +31,10 @@ import Musl
 //
 //   h3-echo-server --api lightweight|channel|quic --certificate-chain-path <pem> --private-key-path <pem>
 //                  [--host 127.0.0.1] [--port 8443] [--threads 1] [--log-level error]
+//                  [--workload echo|responsiveness] [--download-size <bytes>]
+//
+// The responsiveness workload serves `/responsiveness/download/<size>` like the performance workloads do. The `quic`
+// API doesn't parse requests: it answers every one with `--download-size` bytes.
 //
 // It prints the CPU time it has used, in microseconds, whenever it's sent SIGUSR1:
 //
@@ -46,6 +50,8 @@ struct Options {
     var logLevel = Logger.Level.error
     var alpn: String?
     var vectorReadCount = 64
+    var workload = EchoServerWorkload.echo
+    var httpServerTransport = false
 
     static func parse(_ arguments: [String]) -> Options {
         var options = Options()
@@ -80,6 +86,25 @@ struct Options {
                 options.logLevel = Logger.Level(rawValue: value(for: argument))!
             case "--alpn":
                 options.alpn = value(for: argument)
+            case "--workload":
+                switch value(for: argument) {
+                case "echo":
+                    options.workload = .echo
+                case "responsiveness":
+                    if case .echo = options.workload {
+                        options.workload = .responsiveness(downloadSize: 0)
+                    }
+                case let other:
+                    fatalError("Unknown workload \(other), expected echo or responsiveness")
+                }
+            case "--transport":
+                switch value(for: argument) {
+                case "workload": options.httpServerTransport = false
+                case "http-server": options.httpServerTransport = true
+                case let other: fatalError("Unknown transport \(other), expected workload or http-server")
+                }
+            case "--download-size":
+                options.workload = .responsiveness(downloadSize: Int(value(for: argument))!)
             case "--vector-read-count":
                 options.vectorReadCount = Int(value(for: argument))!
             default:
@@ -113,7 +138,6 @@ func run() async throws {
     var logger = Logger(label: "h3-echo-server")
     logger.logLevel = options.logLevel
 
-    // The same transport parameters as the http3-swift-quic performance workload.
     var quicConfiguration = QUICConfiguration.forServer(
         serverName: "",
         authenticationConfiguration: .x509Certificates(
@@ -122,12 +146,25 @@ func run() async throws {
         ),
         applicationProtocols: [options.alpn ?? (options.api == .quic ? "echo" : "h3")]
     )
-    quicConfiguration.initialMaxData = 5_000_000
-    quicConfiguration.initialMaxStreamDataBidiLocal = 131_072
-    quicConfiguration.initialMaxStreamDataBidiRemote = 5_000_000
-    quicConfiguration.initialMaxStreamDataUni = 131_072
-    quicConfiguration.initialMaxStreamsBidi = 100
-    quicConfiguration.initialMaxStreamsUni = 100
+    if options.httpServerTransport {
+        // swift-http-server's `NIOHTTPServerConfiguration.HTTP3.QUICConfiguration.defaults`.
+        quicConfiguration.keyExchangeGroup = .x25519
+        quicConfiguration.maxIdleTimeout = .seconds(30)
+        quicConfiguration.initialMaxData = 1024 * 1024
+        quicConfiguration.initialMaxStreamDataBidiLocal = 1024 * 1024
+        quicConfiguration.initialMaxStreamDataBidiRemote = 1024 * 1024
+        quicConfiguration.initialMaxStreamDataUni = 1024 * 1024
+        quicConfiguration.initialMaxStreamsBidi = 100
+        quicConfiguration.initialMaxStreamsUni = 100
+    } else {
+        // The same transport parameters as the http3-swift-quic performance workload.
+        quicConfiguration.initialMaxData = 5_000_000
+        quicConfiguration.initialMaxStreamDataBidiLocal = 131_072
+        quicConfiguration.initialMaxStreamDataBidiRemote = 5_000_000
+        quicConfiguration.initialMaxStreamDataUni = 131_072
+        quicConfiguration.initialMaxStreamsBidi = 100
+        quicConfiguration.initialMaxStreamsUni = 100
+    }
 
     let group = MultiThreadedEventLoopGroup(numberOfThreads: options.threads)
     signal(SIGUSR1, SIG_IGN)
@@ -144,6 +181,7 @@ func run() async throws {
             quicConfiguration: quicConfiguration,
             group: eventLoop,
             vectorReadCount: options.vectorReadCount,
+            workload: options.workload,
             logger: logger
         )
         channels.append(channel)
