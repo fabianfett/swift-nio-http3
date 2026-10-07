@@ -24,7 +24,12 @@ var swiftSettings: [PackageDescription.SwiftSetting] = [
 let package = Package(
     name: "swift-nio-http3",
     products: [
-        .library(name: "NIOHTTP3", targets: ["NIOHTTP3"])
+        .library(name: "NIOHTTP3", targets: ["NIOHTTP3"]),
+        // Tools for benchmarking the lightweight HTTP/3 streams against the channel based ones and bare QUIC. See
+        // Benchmarks/Echo.
+        .library(name: "H3EchoServer", targets: ["H3EchoServer"]),
+        .executable(name: "h3-echo-server", targets: ["h3-echo-server"]),
+        .executable(name: "h3-load", targets: ["h3-load"]),
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.82.0"),
@@ -77,6 +82,25 @@ let package = Package(
                 .product(name: "NIOHTTPTypes", package: "swift-nio-extras"),
                 .target(name: "HTTP3"),
                 .target(name: "NIOHTTP3"),
+            ],
+            swiftSettings: swiftSettings
+        ),
+        .executableTarget(
+            name: "h3-echo-server",
+            dependencies: [
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .product(name: "Logging", package: "swift-log"),
+                .target(name: "H3EchoServer"),
+            ],
+            swiftSettings: swiftSettings
+        ),
+        .executableTarget(
+            name: "h3-load",
+            dependencies: [
+                .product(name: "NIOCore", package: "swift-nio"),
+                .product(name: "NIOPosix", package: "swift-nio"),
+                .target(name: "H3EchoServer"),
             ],
             swiftSettings: swiftSettings
         ),
