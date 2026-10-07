@@ -30,6 +30,15 @@ public enum EchoServerAPI: String, CaseIterable, Sendable {
     case quic
 }
 
+/// What a server serves.
+public enum EchoServerWorkload: Sendable {
+    /// Echoes each request's body back.
+    case echo
+    /// The performance workloads' `/responsiveness/download/<size>`. The `quic` API can't parse requests, so it
+    /// answers every request with `downloadSize` bytes.
+    case responsiveness(downloadSize: Int)
+}
+
 /// Starts echo servers.
 @available(anyAppleOS 27, *)
 public enum EchoServer {
@@ -44,6 +53,7 @@ public enum EchoServer {
     ///   - settings: The HTTP/3 settings the HTTP/3 servers send.
     ///   - group: The event loops to use.
     ///   - vectorReadCount: How many datagrams to read per system call, on Linux.
+    ///   - workload: What to serve.
     ///   - logger: The logger.
     /// - Returns: The server's UDP channel.
     /// - Throws: If the credentials can't be loaded, or the address can't be bound.
@@ -55,6 +65,7 @@ public enum EchoServer {
         settings: HTTP3Settings = HTTP3Settings(),
         group: any EventLoopGroup = MultiThreadedEventLoopGroup.singleton,
         vectorReadCount: Int = 1,
+        workload: EchoServerWorkload = .echo,
         logger: Logger
     ) async throws -> any Channel {
         let authenticator: Authenticator? =
@@ -71,8 +82,42 @@ public enum EchoServer {
             .channelInitializer { channel in
                 channel.eventLoop.makeCompletedFuture {
                     let handler: any ChannelHandler
-                    switch api {
-                    case .lightweight:
+                    switch (api, workload) {
+                    case (.lightweight, .responsiveness):
+                        handler = QUICHandler<LightweightResponsivenessServer>(
+                            channel: channel,
+                            quicConfiguration: quicConfiguration,
+                            asyncVerifier: nil,
+                            authenticator: authenticator,
+                            logger: logger
+                        ) { connection in
+                            LightweightResponsivenessServer(
+                                http3Connection: .server(connection, settings: settings, logger: logger)
+                            )
+                        }
+
+                    case (.channel, .responsiveness):
+                        handler = Self.makeChannelServerHandler(
+                            channel: channel,
+                            quicConfiguration: quicConfiguration,
+                            authenticator: authenticator,
+                            settings: settings,
+                            logger: logger,
+                            makeStreamHandler: { ChannelResponsivenessHandler() }
+                        )
+
+                    case (.quic, .responsiveness(let downloadSize)):
+                        handler = QUICHandler<QUICDownloadConsumer>(
+                            channel: channel,
+                            quicConfiguration: quicConfiguration,
+                            asyncVerifier: nil,
+                            authenticator: authenticator,
+                            logger: logger
+                        ) { _ in
+                            QUICDownloadConsumer(downloadSize: downloadSize)
+                        }
+
+                    case (.lightweight, .echo):
                         handler = QUICHandler<LightweightEchoServer>(
                             channel: channel,
                             quicConfiguration: quicConfiguration,
@@ -85,16 +130,17 @@ public enum EchoServer {
                             )
                         }
 
-                    case .channel:
+                    case (.channel, .echo):
                         handler = Self.makeChannelServerHandler(
                             channel: channel,
                             quicConfiguration: quicConfiguration,
                             authenticator: authenticator,
                             settings: settings,
-                            logger: logger
+                            logger: logger,
+                            makeStreamHandler: { ChannelEchoHandler() }
                         )
 
-                    case .quic:
+                    case (.quic, .echo):
                         handler = QUICHandler<QUICEchoConsumer>(
                             channel: channel,
                             quicConfiguration: quicConfiguration,
@@ -131,7 +177,8 @@ public enum EchoServer {
         quicConfiguration: QUICConfiguration,
         authenticator: Authenticator?,
         settings: HTTP3Settings,
-        logger: Logger
+        logger: Logger,
+        makeStreamHandler: @escaping @Sendable () -> any ChannelHandler
     ) -> QUICHandler<QUICStreamChannels> {
         QUICHandler(
             channel: channel,
@@ -149,7 +196,7 @@ public enum EchoServer {
                         logger: logger,
                         inboundRequestStreamInitializer: { parameters in
                             parameters.channel.eventLoop.makeCompletedFuture {
-                                try parameters.channel.pipeline.syncOperations.addHandler(ChannelEchoHandler())
+                                try parameters.channel.pipeline.syncOperations.addHandler(makeStreamHandler())
                             }
                         }
                     )
