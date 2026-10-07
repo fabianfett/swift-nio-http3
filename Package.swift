@@ -59,6 +59,7 @@ let package = Package(
                 .product(name: "NIOQUICHelpers", package: "swift-nio-quic-helpers"),
                 .product(name: "DequeModule", package: "swift-collections"),
                 .product(name: "NIOHTTPTypes", package: "swift-nio-extras"),
+                .product(name: "NIOQUIC", package: "swift-nio-quic"),
                 .target(name: "HTTP3"),
                 .target(name: "QPACK"),
             ],
