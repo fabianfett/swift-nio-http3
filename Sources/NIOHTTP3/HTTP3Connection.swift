@@ -316,6 +316,8 @@ final class HTTP3ConnectionEventsHandler<Consumer: HTTP3Consumer>: ChannelInboun
     }
 
     func handlerRemoved(context: ChannelHandlerContext) {
+        // Also covers a channel which closes without ever becoming active.
+        self.context.connectionClosed()
         self.box.connection = nil
     }
 
