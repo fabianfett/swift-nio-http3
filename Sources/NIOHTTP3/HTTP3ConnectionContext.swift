@@ -40,9 +40,11 @@ final class HTTP3ConnectionContext {
     private var stateMachine: HTTP3ConnectionStateMachine
     private let logger: Logger
 
-    /// The connection channel, to close the connection with. Weak: the channel owns the consumer, which owns
-    /// this.
-    private weak var channel: (any Channel)?
+    /// The connection channel, to close the connection with.
+    ///
+    /// The channel owns the consumer, which owns this: the reference is dropped in ``connectionClosed()`` to
+    /// break the cycle.
+    private var channel: (any Channel)?
 
     /// Where outbound frames are encoded before they are copied into a stream. Reused, so encoding doesn't
     /// allocate.
@@ -195,6 +197,7 @@ final class HTTP3ConnectionContext {
     /// The connection is gone.
     func connectionClosed() {
         self.isClosing = true
+        self.channel = nil
         _ = self.stateMachine.shutdownConnectionImmediately()
     }
 
