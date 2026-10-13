@@ -15,7 +15,6 @@
 import DequeModule
 import HTTPTypes
 import NIOQUICHelpers
-@_spi(PackageInternal) import QPACK
 
 /// A state machine which holds qpack encoder and decoder.
 /// You can ask it to encode/decode things, and inform it of incoming instructions.
@@ -93,26 +92,14 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
                 }
             case .awaitingStream(let awaitingStream):
                 self = .init(state: .awaitingStream(awaitingStream))
-                return .emitConnectionError(Self.duplicateSettingsError(location: .here()))
+                return .emitConnectionError(.duplicateSettings)
             case .withDynamic(let withDynamic):
                 self = .init(state: .withDynamic(withDynamic))
-                return .emitConnectionError(Self.duplicateSettingsError(location: .here()))
+                return .emitConnectionError(.duplicateSettings)
             case .withoutDynamic(let withoutDynamic):
                 self = .init(state: .withoutDynamic(withoutDynamic))
-                return .emitConnectionError(Self.duplicateSettingsError(location: .here()))
+                return .emitConnectionError(.duplicateSettings)
             }
-        }
-
-        /// RFC 9114 § 7.2.4: the peer may only send SETTINGS once, and a second one is a connection error.
-        @inline(never)
-        private static func duplicateSettingsError(location: HTTP3Error.SourceLocation) -> HTTP3Error {
-            HTTP3Error(
-                code: .unexpectedFrame,
-                message: "Received a second settings frame",
-                cause: nil,
-                errorCode: .frameUnexpected,
-                location: location
-            )
         }
 
         enum OutboundEncoderStreamReadyAction {
@@ -173,54 +160,31 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
         }
 
         enum IncomingDecoderInstructionAction {
-            case emitConnectionError(HTTP3Error)
+            case emitConnectionError(QPACKError)
         }
 
         fileprivate mutating func receivedIncomingDecoderInstruction(
             _ instruction: QPACKDecoderInstruction
         ) -> IncomingDecoderInstructionAction? {
-            @inline(never)
-            func noDynamicTableError(location: HTTP3Error.SourceLocation) -> HTTP3Error {
-                HTTP3Error(
-                    code: .qpackDecoderStreamError,
-                    message: "Decoder instruction received when dynamic table not being used",
-                    cause: nil,
-                    errorCode: .qpackDecoderStreamError,
-                    location: location
-                )
-            }
             switch consume self.state {
             case .initial(let initial):
                 self = .init(state: .initial(initial))
-                return .emitConnectionError(noDynamicTableError(location: .here()))
+                return .emitConnectionError(.decoderInstructionWithoutDynamicTable)
             case .awaitingStream(let awaitingStream):
                 self = .init(state: .awaitingStream(awaitingStream))
-                return .emitConnectionError(noDynamicTableError(location: .here()))
+                return .emitConnectionError(.decoderInstructionWithoutDynamicTable)
             case .withoutDynamic(let withoutDynamic):
                 self = .init(state: .withoutDynamic(withoutDynamic))
-                return .emitConnectionError(noDynamicTableError(location: .here()))
+                return .emitConnectionError(.decoderInstructionWithoutDynamicTable)
             case .withDynamic(var withDynamic):
                 do {
                     try withDynamic.encoder.processInstruction(instruction)
                     self = .init(state: .withDynamic(withDynamic))
                     return nil
                 } catch {
-                    @inline(never)
-                    func invalidDecoderInstructionError(
-                        cause: any Error,
-                        location: HTTP3Error.SourceLocation
-                    ) -> HTTP3Error {
-                        HTTP3Error(
-                            code: .qpackDecoderStreamError,
-                            message: "Invalid decoder instruction",
-                            cause: cause,
-                            errorCode: .qpackDecoderStreamError,
-                            location: location
-                        )
-                    }
                     // TODO: move to error state?
                     self = .init(state: .withDynamic(withDynamic))
-                    return .emitConnectionError(invalidDecoderInstructionError(cause: error, location: .here()))
+                    return .emitConnectionError(.invalidDecoderInstruction)
                 }
             }
         }
@@ -304,7 +268,7 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
 
     enum GotRemoteSettingsAction {
         case makeEncoderInstructionStream
-        case emitConnectionError(HTTP3Error)
+        case emitConnectionError(QPACKError)
     }
 
     /// Call this when the settings have been received from the remote.
@@ -359,7 +323,7 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
         case informDecodeError(InformDecodeError, DecodeContext)
 
         /// Send a connection-level error.
-        case emitConnectionError(HTTP3Error, DecodeContext)
+        case emitConnectionError(QPACKError, DecodeContext)
 
         struct InformDecodeResult: Hashable, Sendable {
             var fields: [HTTPField]
@@ -378,10 +342,10 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
         }
 
         struct InformDecodeError {
-            var error: HTTP3Error
+            var error: QPACKError
             var streamID: QUICStreamID
 
-            init(error: HTTP3Error, streamID: QUICStreamID) {
+            init(error: QPACKError, streamID: QUICStreamID) {
                 self.error = error
                 self.streamID = streamID
             }
@@ -389,29 +353,19 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
     }
 
     mutating func decodeHeaders(
-        _ headers: HTTP3PartialFrame.Headers,
+        _ fieldSection: FieldSection,
         forStream streamID: QUICStreamID,
         context: DecodeContext
     ) -> DecodeHeaderAction? {
-        @inline(never)
-        func invalidFieldSectionPrefixError(location: HTTP3Error.SourceLocation) -> HTTP3Error {
-            HTTP3Error(
-                code: .qpackDecoderError,
-                message: "Invalid field section prefix",
-                cause: nil,
-                errorCode: .qpackDecompressionFailed,
-                location: location
-            )
-        }
-        guard let prefix = self.qpackDecoder.decodeFieldSectionPrefix(headers.fieldSection.prefix) else {
+        guard let prefix = self.qpackDecoder.decodeFieldSectionPrefix(fieldSection.prefix) else {
             // The field section prefix can't have been produced by a conformant encoder
             // RFC 9204 4.5.1.1: If the decoder encounters a value of EncodedInsertCount that could not have been produced by a
             // conformant encoder, it MUST treat this as a connection error of type QPACK_DECOMPRESSION_FAILED.
-            return .emitConnectionError(invalidFieldSectionPrefixError(location: .here()), context)
+            return .emitConnectionError(.invalidFieldSectionPrefix, context)
         }
         let result = self.qpackDecoder.decodeFieldSection(
             prefix: prefix,
-            lines: headers.fieldSection.lines,
+            lines: fieldSection.lines,
             streamID: streamID
         )
         switch result {
@@ -434,9 +388,9 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
             do {
                 try self.decoderQueue.add(
                     .init(
-                        headers: headers,
+                        fieldSection: fieldSection,
                         prefix: prefix,
-                        lines: headers.fieldSection.lines,
+                        lines: fieldSection.lines,
                         streamID: streamID,
                         context: context
                     )
@@ -445,29 +399,16 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
             } catch {
                 switch error {
                 case .reachedMaxSize:
-                    @inline(never)
-                    func tooManyBlockedStreamsError(
-                        cause: any Error,
-                        location: HTTP3Error.SourceLocation
-                    ) -> HTTP3Error {
-                        HTTP3Error(
-                            code: .qpackDecoderError,
-                            message: "Too many streams blocked on QPACK",
-                            cause: cause,
-                            errorCode: .qpackDecompressionFailed,
-                            location: location
-                        )
-                    }
-                    return .emitConnectionError(tooManyBlockedStreamsError(cause: error, location: .here()), context)
+                    return .emitConnectionError(.tooManyBlockedStreams, context)
                 }
             }
 
         case .error(let qpackError):
-            switch self.errorTypeForDecoderError(qpackError, streamID: streamID) {
-            case .connection(let h3Error):
-                return .emitConnectionError(h3Error, context)
-            case .stream(let h3Error):
-                return .informDecodeError(.init(error: h3Error, streamID: streamID), context)
+            switch self.errorTypeForDecoderError(qpackError) {
+            case .connection(let error):
+                return .emitConnectionError(error, context)
+            case .stream(let error):
+                return .informDecodeError(.init(error: error, streamID: streamID), context)
             }
         }
     }
@@ -488,11 +429,11 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
             // This implies a bug in `popIfDecodable` because we shouldn't get here if something isn't decodable yet
             fatalError("Tried to decode an entry which can't be decoded")
         case .error(let qpackError):
-            switch self.errorTypeForDecoderError(qpackError, streamID: entry.streamID) {
-            case .connection(let h3Error):
-                return .emitConnectionError(h3Error, entry.context)
-            case .stream(let h3Error):
-                return .informDecodeError(.init(error: h3Error, streamID: entry.streamID), entry.context)
+            switch self.errorTypeForDecoderError(qpackError) {
+            case .connection(let error):
+                return .emitConnectionError(error, entry.context)
+            case .stream(let error):
+                return .informDecodeError(.init(error: error, streamID: entry.streamID), entry.context)
             }
         case .success(let fields, let instruction):
             let writeAction = instruction.flatMap { self.outboundDecoderInstructionQueue.writeDecoderInstruction($0) }
@@ -520,45 +461,28 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
     }
 
     private enum ErrorType {
-        case connection(HTTP3Error)
-        case stream(HTTP3Error)
+        case connection(QPACKError)
+        case stream(QPACKError)
     }
 
-    private func errorTypeForDecoderError(
-        _ qpackError: QPACKDecoderError,
-        streamID: QUICStreamID
-    ) -> ErrorType {
-        switch qpackError {
+    private func errorTypeForDecoderError(_ error: QPACKDecoderError) -> ErrorType {
+        switch error {
         case .invalidFieldSection, .invalidReference:
             // If the decoder encounters a reference in a field line representation to a dynamic table entry that has
             // already been evicted or that has an absolute index greater than or equal to the declared Required
             // Insert Count (Section 4.5.1), it MUST treat this as a connection error of type QPACK_DECOMPRESSION_FAILED.
-            let h3Error = HTTP3Error(
-                code: .qpackDecoderError,
-                message: "Could not decode QPACK headers for stream \(streamID)",
-                cause: qpackError,
-                errorCode: .qpackDecompressionFailed,
-                location: .here()
-            )
-            return .connection(h3Error)
+            return .connection(.invalidFieldSection)
         case .invalidHeaderName:
             // Here we did decode fine, but the header is not valid in HTTP/3 (e.g. it isn't lower case)
             // This is a malformed message, a stream level error. Not a connection error
-            let h3Error = HTTP3Error(
-                code: .qpackDecoderError,
-                message: "Could not decode QPACK headers",
-                cause: qpackError,
-                errorCode: .messageError,
-                location: .here()
-            )
-            return .stream(h3Error)
+            return .stream(.invalidFieldName)
         }
     }
 
     enum IncomingEncoderInstructionAction {
         /// The new incoming instruction resulted in previously-blocked headers now being decodable.
         case sendDecoderInstruction(QPACKDecoderInstruction)
-        case emitConnectionError(HTTP3Error)
+        case emitConnectionError(QPACKError)
     }
 
     /// Inform the state machine of a new incoming instruction. After this, you should call ``checkPendingDecodes()`` because the new instruction
@@ -566,19 +490,6 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
     mutating func receivedIncomingEncoderInstruction(
         _ instruction: QPACKEncoderInstruction
     ) -> IncomingEncoderInstructionAction? {
-        @inline(never)
-        func invalidEncoderInstructionError(
-            cause: any Error,
-            location: HTTP3Error.SourceLocation
-        ) -> HTTP3Error {
-            HTTP3Error(
-                code: .qpackEncoderStreamError,
-                message: "Invalid encoder instruction",
-                cause: cause,
-                errorCode: .qpackEncoderStreamError,
-                location: location
-            )
-        }
         do {
             let i = try self.qpackDecoder.processInstruction(instruction)
             switch self.outboundDecoderInstructionQueue.writeDecoderInstruction(i) {
@@ -588,12 +499,12 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
                 return .none
             }
         } catch {
-            return .emitConnectionError(invalidEncoderInstructionError(cause: error, location: .here()))
+            return .emitConnectionError(.invalidEncoderInstruction)
         }
     }
 
     enum IncomingDecoderInstructionAction {
-        case emitConnectionError(HTTP3Error)
+        case emitConnectionError(QPACKError)
     }
 
     mutating func receivedIncomingDecoderInstruction(

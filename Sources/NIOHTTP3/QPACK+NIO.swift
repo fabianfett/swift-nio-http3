@@ -23,11 +23,36 @@ extension QPACKEncoderInstructionDecoder: NIOSingleStepByteToMessageDecoder {}
 
 @available(anyAppleOS 26.0, *)
 typealias NIOQPACKCoder<
-    ConnectionDelegate: HTTP3.QPACKConnectionDelegate,
+    ConnectionDelegate: QPACK.QPACKConnectionDelegate,
     StreamDelegate: HTTP3StreamDelegate
-> = HTTP3.QPACKCoder<
+> = QPACK.QPACKCoder<
     QPACKOutboundEncoderStream,
     QPACKOutboundDecoderStream,
     ConnectionDelegate,
     HTTP3StreamHandler<StreamDelegate, ConnectionDelegate>
 >
+
+/// Gives the instructions read from the peer's QPACK streams to the ``QPACKCoder``.
+///
+/// Failing to read the streams isn't a failure of the coder, so these errors are reported as the ``HTTP3Error`` they
+/// are, with all the details the stream handlers know about.
+@available(anyAppleOS 26.0, *)
+struct QPACKInboundStreamDelegate<
+    ConnectionDelegate: QPACK.QPACKConnectionDelegate,
+    StreamDelegate: HTTP3StreamDelegate
+>: QPACKInboundEncoderStreamDelegate, QPACKInboundDecoderStreamDelegate {
+    let qpackCoder: NIOQPACKCoder<ConnectionDelegate, StreamDelegate>
+    let reportError: (HTTP3Error) -> Void
+
+    func onReceivedInstruction(_ instruction: QPACKEncoderInstruction) {
+        self.qpackCoder.receivedIncomingEncoderInstruction(instruction)
+    }
+
+    func onReceivedInstruction(_ instruction: QPACKDecoderInstruction) {
+        self.qpackCoder.receivedIncomingDecoderInstruction(instruction)
+    }
+
+    func onError(_ error: HTTP3Error) {
+        self.reportError(error)
+    }
+}

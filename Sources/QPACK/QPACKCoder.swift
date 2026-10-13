@@ -14,7 +14,6 @@
 
 public import HTTPTypes
 public import NIOQUICHelpers
-@_spi(PackageInternal) public import QPACK
 
 /// A stream to send encoder instructions on, which the peer can then use in its QPACKDecoder
 ///
@@ -42,10 +41,10 @@ public protocol QPACKOutboundDecoderStream: ~Copyable {
 /// An object representing an HTTP3Connection to forward connection level errors to.
 @_spi(PackageInternal)
 public protocol QPACKConnectionDelegate {
-    /// Tear the connection down. The error's ``HTTP3Error/h3ErrorCode`` is the code to close it with.
-    func connectionError(_ error: HTTP3Error)
+    /// Tear the connection down.
+    func connectionError(_ error: QPACKError)
 
-    /// Open a unidirectional ``HTTP3StreamType/Unidirectional/qpackEncoder`` stream and pass it to
+    /// Open a unidirectional `HTTP3StreamType.Unidirectional.qpackEncoder` stream and pass it to
     /// ``QPACKCoder/outboundEncoderStreamReady(_:)``.
     ///
     /// Called at most once per connection, and only if the peer permits the dynamic table. Until the stream is
@@ -69,7 +68,7 @@ public protocol QPACKDecodeReceiver {
     /// - Important: If the decoder has all the necessary QPACK decode information available the decoder
     ///              will invoke this method syncronously from
     ///              ``QPACKCoder/decodeHeaders(_:streamID:decodeReceiver:)``.
-    func decodeResult(_ result: Result<[HTTPField], HTTP3Error>)
+    func decodeResult(_ result: Result<[HTTPField], QPACKError>)
 }
 
 /// An object encapsulating all the QPACK encoding and decoding. It implements the QPACK procedures while being
@@ -101,7 +100,7 @@ public protocol QPACKDecodeReceiver {
 public final class QPACKCoder<
     OutboundEncoderStream: QPACKOutboundEncoderStream & ~Copyable,
     OutboundDecoderStream: QPACKOutboundDecoderStream & ~Copyable,
-    ConnectionDelegate: HTTP3.QPACKConnectionDelegate,
+    ConnectionDelegate: QPACKConnectionDelegate,
     DecodeReceiver: QPACKDecodeReceiver
 > {
 
@@ -190,10 +189,6 @@ public final class QPACKCoder<
         }
     }
 
-    public func connectionError(_ httpError: HTTP3Error) {
-        self.connection.connectionError(httpError)
-    }
-
     // MARK: Encode
 
     /// QPACK encode your HTTP fields. If new instructions need to be send to the peer as a side-effect of the encode the
@@ -207,7 +202,7 @@ public final class QPACKCoder<
     ///
     /// - Returns: The encoded field section, ready to be framed as a HEADERS frame.
     @_spi(PackageInternal)
-    public func encodeHeaders(_ fields: [HTTPField], streamID: QUICStreamID) -> HTTP3PartialFrame.Headers {
+    public func encodeHeaders(_ fields: [HTTPField], streamID: QUICStreamID) -> FieldSection {
         let result = self.stateMachine.encodeHeaders(fields, forStream: streamID)
 
         if !result.instructions.isEmpty {
@@ -216,7 +211,7 @@ public final class QPACKCoder<
             self.outboundEncoderStream!.sendInstructions(result.instructions)
         }
 
-        return HTTP3PartialFrame.Headers(fieldSection: result.fieldSection)
+        return result.fieldSection
     }
 
     /// Call this method as a response to the ``ConnectionDelegate/makeOutboundEncoderStream()``
@@ -271,16 +266,16 @@ public final class QPACKCoder<
     ///              will invoke the ``QPACKDecodeReceiver/decodeResult(_:)`` method syncronously.
     ///
     /// - Parameters:
-    ///   - headers: The headers to QPACK decode
+    ///   - fieldSection: The field section to QPACK decode
     ///   - streamID: The stream id of the stream, that received the header frame
     ///   - decodeReceiver: The object that needs to be informed about the decode result.
     @_spi(PackageInternal)
     public func decodeHeaders(
-        _ headers: HTTP3PartialFrame.Headers,
+        _ fieldSection: FieldSection,
         streamID: QUICStreamID,
         decodeReceiver: DecodeReceiver
     ) {
-        let action = self.stateMachine.decodeHeaders(headers, forStream: streamID, context: decodeReceiver)
+        let action = self.stateMachine.decodeHeaders(fieldSection, forStream: streamID, context: decodeReceiver)
         self.runDecodeHeaderAction(action)
     }
 
@@ -318,8 +313,8 @@ public final class QPACKCoder<
         case .sendDecoderInstruction(let qPACKDecoderInstruction):
             // Safe to unwrap: see `outboundDecoderStream`.
             self.outboundDecoderStream!.sendInstruction(qPACKDecoderInstruction)
-        case .emitConnectionError(let http3Error):
-            self.connection.connectionError(http3Error)
+        case .emitConnectionError(let error):
+            self.connection.connectionError(error)
         case .none:
             break
         }
@@ -342,9 +337,9 @@ public final class QPACKCoder<
         case .informDecodeError(let informDecodeError, let receiver):
             receiver.decodeResult(.failure(informDecodeError.error))
 
-        case .emitConnectionError(let http3Error, let receiver):
-            self.connection.connectionError(http3Error)
-            receiver.decodeResult(.failure(http3Error))
+        case .emitConnectionError(let error, let receiver):
+            self.connection.connectionError(error)
+            receiver.decodeResult(.failure(error))
 
         case .none:
             // the required encoder dynamic table update hasn't arrived yet.

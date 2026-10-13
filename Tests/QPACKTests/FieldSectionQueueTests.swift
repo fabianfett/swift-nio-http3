@@ -13,10 +13,9 @@
 //===----------------------------------------------------------------------===//
 
 import NIOQUICHelpers
-@_spi(PackageInternal) import QPACK
 import Testing
 
-@_spi(PackageInternal) @testable import HTTP3
+@_spi(PackageInternal) @testable import QPACK
 
 struct FieldSectionQueueTests {
     private func makeTestEntry(
@@ -26,7 +25,7 @@ struct FieldSectionQueueTests {
     ) -> FieldSectionQueue<Int>.Entry {
         let prefix = FieldSectionPrefix(requiredInsertCount: requiredInsertCount, base: 0)
         return FieldSectionQueue.Entry(
-            headers: .init(fieldSection: .init(prefix: prefix.encode(maxCapacity: 100), lines: [])),
+            fieldSection: .init(prefix: prefix.encode(maxCapacity: 100), lines: []),
             prefix: prefix,
             lines: [],
             streamID: streamID,
