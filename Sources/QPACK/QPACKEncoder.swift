@@ -463,27 +463,49 @@ public struct DynamicQPACKEncoder {
     @_spi(PackageInternal)
     public mutating func processInstruction(
         _ instruction: QPACKDecoderInstruction
-    ) throws {
+    ) throws(QPACKError.DecoderInstructionError) {
         switch instruction {
         case .insertCountIncrement(let increment):
-            try self.table.insertCountIncrement(by: increment)
+            do throws(DynamicHeaderTableError) {
+                try self.table.insertCountIncrement(by: increment)
+            } catch {
+                throw .init(error)
+            }
         case .sectionAcknowledgement(let streamID):
             // all dynamic table entries used in this section are now implicitly acked
-            guard let message = try self.streamTracker.nextMessage(forStream: streamID) else {
+            let message: StreamTrackerMessage?
+            do throws(QPACKEncoderError) {
+                message = try self.streamTracker.nextMessage(forStream: streamID)
+            } catch {
+                throw .init(error)
+            }
+            guard let message else {
                 // If an encoder receives a Section Acknowledgment instruction referring to a stream on which every
                 // encoded field section with a non-zero Required Insert Count has already been acknowledged,
                 // this MUST be treated as a connection error of type QPACK_DECODER_STREAM_ERROR.
-                throw QPACKEncoderError.unexpectedStreamAck
+                throw .unexpectedSectionAcknowledgment
             }
-            try self.acknowledgeMessage(message, incrementKnownReceivedCount: true)
-            try self.streamTracker.removeIfEmpty(streamID: streamID)
+            do throws(DynamicHeaderTableError) {
+                try self.acknowledgeMessage(message, incrementKnownReceivedCount: true)
+            } catch {
+                throw .init(error)
+            }
+            do throws(QPACKEncoderError) {
+                try self.streamTracker.removeIfEmpty(streamID: streamID)
+            } catch {
+                throw .init(error)
+            }
         case .streamCancellation(let streamID):
             // all dynamic table entries used in this section are now implicitly acked
             if var stream = self.streamTracker.removeStream(withID: streamID) {
                 while let message = stream.nextMessage() {
                     // incrementKnownReceivedCount is false because the message wasn't necessarily read
                     // See 9204 § 2.2.2.2: An encoder cannot infer from this instruction that any updates to the dynamic table have been received
-                    try self.acknowledgeMessage(message, incrementKnownReceivedCount: false)
+                    do throws(DynamicHeaderTableError) {
+                        try self.acknowledgeMessage(message, incrementKnownReceivedCount: false)
+                    } catch {
+                        throw .init(error)
+                    }
                 }
             }
         }
@@ -492,7 +514,7 @@ public struct DynamicQPACKEncoder {
     private mutating func acknowledgeMessage(
         _ message: StreamTrackerMessage,
         incrementKnownReceivedCount: Bool
-    ) throws {
+    ) throws(DynamicHeaderTableError) {
         // When the stream is acknowledged or cancelled by the decoder, we need to decrease the ref count for the entries used
         // Also, the highest entry amongst them becomes the known received count
         var highestAbsoluteIndex: Int?

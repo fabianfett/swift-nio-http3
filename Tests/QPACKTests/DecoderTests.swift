@@ -387,7 +387,7 @@ struct DecoderTests {
     @Test
     func testSetCapacityInvalid() {
         var decoder = QPACKDecoder(dynamicTableMaxCapacity: 1000)
-        #expect(throws: DynamicHeaderTableError.capacityTooHigh) {
+        #expect(throws: QPACKError.EncoderInstructionError.capacityTooHigh) {
             try decoder.processInstruction(.setDynamicTableCapacity(2000))
         }
     }
@@ -404,7 +404,7 @@ struct DecoderTests {
         var decoder = QPACKDecoder(dynamicTableMaxCapacity: 1000)
         try decoder.assertSetDynamicTableCapacity(100)
         // Upper case field names are forbidden
-        #expect(throws: QPACKDecoderError.invalidHeaderName) {
+        #expect(throws: QPACKError.EncoderInstructionError.invalidHeaderName) {
             try decoder.processInstruction(.insertWithLiteralName(name: "Test", value: "1"))
         }
     }
@@ -413,7 +413,7 @@ struct DecoderTests {
     func testInsertLiteralNoSpace() throws {
         var decoder = QPACKDecoder(dynamicTableMaxCapacity: 1000)
         try decoder.assertSetDynamicTableCapacity(1)
-        #expect(throws: HeaderTableError.insufficientStorage) {
+        #expect(throws: QPACKError.EncoderInstructionError.entryTooLarge) {
             try decoder.processInstruction(.insertWithLiteralName(name: "test", value: "1"))
         }
     }
@@ -437,7 +437,7 @@ struct DecoderTests {
             relativeIndex: 2000,
             value: "hi"
         )
-        #expect(throws: QPACKDecoderError.invalidReference) {
+        #expect(throws: QPACKError.EncoderInstructionError.invalidReference) {
             try decoder.processInstruction(instruction)
         }
     }
@@ -458,7 +458,7 @@ struct DecoderTests {
         var decoder = QPACKDecoder(dynamicTableMaxCapacity: 1000)
         // Relative index 0 is invalid because there's nothing in the table
         let instruction = QPACKEncoderInstruction.insertWithNameReference(.dynamicTable, relativeIndex: 0, value: "hi")
-        #expect(throws: QPACKDecoderError.invalidReference) {
+        #expect(throws: QPACKError.EncoderInstructionError.invalidReference) {
             try decoder.processInstruction(instruction)
         }
     }
@@ -478,7 +478,7 @@ struct DecoderTests {
         var decoder = QPACKDecoder(dynamicTableMaxCapacity: 1000)
         try decoder.assertSetDynamicTableCapacity(1000)
         // Duplicate the last entry. But it doesn't exist because we didn't insert anything yet
-        #expect(throws: QPACKDecoderError.invalidReference) {
+        #expect(throws: QPACKError.EncoderInstructionError.invalidReference) {
             try decoder.processInstruction(.duplicateEntry(relativeIndex: 0))
         }
     }

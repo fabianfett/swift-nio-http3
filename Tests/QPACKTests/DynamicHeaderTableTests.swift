@@ -408,10 +408,7 @@ struct DynamicHeaderTableTests {
             targetEvictableFraction: 0.0,
             assumeAllEntriesReceived: false
         )
-        // Can't set current higher than max
-        #expect(throws: DynamicHeaderTableError.capacityTooHigh) {
-            try table.setCurrentCapacity(200)
-        }
+        // Setting current higher than max is rejected by the decoder, see `DecoderTests.testSetCapacityInvalid`.
         // Can set current to lower than max
         try table.setCurrentCapacity(50)
         // Can set current equal to max

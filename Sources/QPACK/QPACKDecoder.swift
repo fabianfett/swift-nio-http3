@@ -74,14 +74,22 @@ public struct QPACKDecoder {
     @_spi(PackageInternal)
     public mutating func processInstruction(
         _ instruction: QPACKEncoderInstruction
-    ) throws -> QPACKDecoderInstruction? {
+    ) throws(QPACKError.EncoderInstructionError) -> QPACKDecoderInstruction? {
         switch instruction {
         case .setDynamicTableCapacity(let capacity):
-            try self.dynamicTable.setCurrentCapacity(capacity)
+            guard capacity <= self.dynamicTable.maximumCapacity else {
+                // The peer chose a capacity higher than the maximum we sent in the SETTINGS frame.
+                throw .capacityTooHigh
+            }
+            do throws(HeaderTableError) {
+                try self.dynamicTable.setCurrentCapacity(capacity)
+            } catch {
+                throw .init(error)
+            }
             return nil
         case .insertWithLiteralName(let name, let value):
             guard let fieldName = HTTPField.Name(parsed: name) else {
-                throw QPACKDecoderError.invalidHeaderName
+                throw .invalidHeaderName
             }
             return try self.addDynamicTableEntry(named: fieldName, value: value)
         case .insertWithNameReference(let table, let relativeIndex, let value):
@@ -89,19 +97,19 @@ public struct QPACKDecoder {
             switch table {
             case .staticTable:
                 guard let staticTableEntry = StaticHeaderTable.get(at: relativeIndex) else {
-                    throw QPACKDecoderError.invalidReference
+                    throw .invalidReference
                 }
                 name = staticTableEntry.0
             case .dynamicTable:
                 guard let entry = self.dynamicTable.get(relativeIndex: relativeIndex) else {
-                    throw QPACKDecoderError.invalidReference
+                    throw .invalidReference
                 }
                 name = entry.name
             }
             return try self.addDynamicTableEntry(named: name, value: value)
         case .duplicateEntry(let relativeIndex):
             guard let original = self.dynamicTable.get(relativeIndex: relativeIndex) else {
-                throw QPACKDecoderError.invalidReference
+                throw .invalidReference
             }
             return try self.addDynamicTableEntry(named: original.name, value: original.value)
         }
@@ -111,8 +119,12 @@ public struct QPACKDecoder {
     private mutating func addDynamicTableEntry(
         named name: HTTPField.Name,
         value: String
-    ) throws -> QPACKDecoderInstruction? {
-        try self.dynamicTable.addHeader(named: name, value: value)
+    ) throws(QPACKError.EncoderInstructionError) -> QPACKDecoderInstruction? {
+        do throws(HeaderTableError) {
+            try self.dynamicTable.addHeader(named: name, value: value)
+        } catch {
+            throw .init(error)
+        }
         let insertCount = self.dynamicTable.insertCount
         let shouldAck = self.stateSynchronizer.dynamicTableEntryAdded(insertCount: insertCount)
         if shouldAck {

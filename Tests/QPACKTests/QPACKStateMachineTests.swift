@@ -492,7 +492,7 @@ struct QPACKStateMachineTests {
             Issue.record("Unexpected action")
             return
         }
-        #expect(error == .invalidDecoderInstruction)
+        #expect(error == .invalidDecoderInstruction(.insertCountIncrementTooHigh))
     }
 
     // MARK: Encoder instructions
@@ -506,7 +506,7 @@ struct QPACKStateMachineTests {
             Issue.record("Unexpected action")
             return
         }
-        #expect(error == .invalidEncoderInstruction)
+        #expect(error == .invalidEncoderInstruction(.capacityTooHigh))
     }
 
     @Test func testInsertTooLargeEntry() {
@@ -524,7 +524,7 @@ struct QPACKStateMachineTests {
             Issue.record("Unexpected action")
             return
         }
-        #expect(error == .invalidEncoderInstruction)
+        #expect(error == .invalidEncoderInstruction(.entryTooLarge))
     }
 
     // MARK: Request stream closing

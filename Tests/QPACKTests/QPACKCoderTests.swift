@@ -469,7 +469,7 @@ struct QPACKCoderTests {
         let coder = Self.makeTestCoder(errorDelegate: connection)
 
         // Invalid because it exceeds the capacity we advertised.
-        #expect(throws: QPACKError.invalidEncoderInstruction) {
+        #expect(throws: QPACKError.invalidEncoderInstruction(.capacityTooHigh)) {
             try coder.receivedIncomingEncoderInstruction(.setDynamicTableCapacity(1025))
         }
     }

@@ -23,13 +23,13 @@ public enum QPACKError: Error, Sendable, Hashable {
     case duplicateSettings
 
     /// The peer's encoder sent an instruction which can't be processed (RFC 9204 § 6).
-    case invalidEncoderInstruction
+    case invalidEncoderInstruction(EncoderInstructionError)
 
     /// The peer's decoder sent an instruction while no dynamic table is in use.
     case decoderInstructionWithoutDynamicTable
 
     /// The peer's decoder sent an instruction which can't be processed (RFC 9204 § 6).
-    case invalidDecoderInstruction
+    case invalidDecoderInstruction(DecoderInstructionError)
 
     /// The prefix of a field section could not have been produced by a conformant encoder (RFC 9204 § 4.5.1.1).
     case invalidFieldSectionPrefix
@@ -56,6 +56,77 @@ public enum QPACKError: Error, Sendable, Hashable {
             // absolute index greater than or equal to the declared Required Insert Count MUST be treated as a
             // connection error of type QPACK_DECOMPRESSION_FAILED.
             return true
+        }
+    }
+}
+
+extension QPACKError {
+    /// Why an instruction from the peer's encoder can't be processed (RFC 9204 § 4.3).
+    @nonexhaustive
+    public enum EncoderInstructionError: Error, Sendable, Hashable {
+        /// The capacity is higher than the maximum we advertised (RFC 9204 § 4.3.1).
+        case capacityTooHigh
+
+        /// The new entry is larger than the capacity of the dynamic table (RFC 9204 § 3.2.2).
+        case entryTooLarge
+
+        /// Making room would evict an entry which may still be referenced (RFC 9204 § 2.1.1).
+        case cannotEvict
+
+        /// The instruction references an entry which doesn't exist.
+        case invalidReference
+
+        /// The literal field name is not valid in HTTP/3.
+        case invalidHeaderName
+    }
+
+    /// Why an instruction from the peer's decoder can't be processed (RFC 9204 § 4.4).
+    @nonexhaustive
+    public enum DecoderInstructionError: Error, Sendable, Hashable {
+        /// The Insert Count Increment is zero (RFC 9204 § 4.4.3).
+        case zeroInsertCountIncrement
+
+        /// The Insert Count Increment acknowledges more entries than were inserted (RFC 9204 § 4.4.3).
+        case insertCountIncrementTooHigh
+
+        /// The Section Acknowledgment refers to a stream without unacknowledged field sections (RFC 9204 § 4.4.1).
+        case unexpectedSectionAcknowledgment
+    }
+}
+
+extension QPACKError.EncoderInstructionError {
+    init(_ error: HeaderTableError) {
+        switch error {
+        case .insufficientStorage:
+            self = .entryTooLarge
+        case .cannotPurge:
+            self = .cannotEvict
+        }
+    }
+}
+
+extension QPACKError.DecoderInstructionError {
+    init(_ error: DynamicHeaderTableError) {
+        switch error {
+        case .incrementTooLow:
+            self = .zeroInsertCountIncrement
+        case .incrementTooHigh:
+            self = .insertCountIncrementTooHigh
+        case .ackCountTooLow, .ackCountTooHigh:
+            // A Section Acknowledgment only acknowledges entries our own stream tracker recorded as inserted.
+            assertionFailure("Section Acknowledgment acknowledged entries which weren't inserted: \(error)")
+            self = .unexpectedSectionAcknowledgment
+        }
+    }
+
+    init(_ error: QPACKEncoderError) {
+        switch error {
+        case .unexpectedStreamAck:
+            self = .unexpectedSectionAcknowledgment
+        case .unknownStream:
+            // The stream tracker only forgets a stream once all of its field sections are acknowledged.
+            assertionFailure("Section Acknowledgment for a stream the stream tracker doesn't know")
+            self = .unexpectedSectionAcknowledgment
         }
     }
 }

@@ -384,7 +384,7 @@ struct EncoderTests {
         ).fieldSection
         #expect(encoded.prefix.decode(totalInserts: 0, maxCapacity: 100)?.requiredInsertCount == 0)
         #expect(encoded.lines == [.indexed(.staticTable, index: 63)])
-        #expect(throws: QPACKEncoderError.unexpectedStreamAck) {
+        #expect(throws: QPACKError.DecoderInstructionError.unexpectedSectionAcknowledgment) {
             try encoder.processInstruction(.sectionAcknowledgement(streamID: 1))
         }
     }
@@ -404,7 +404,7 @@ struct EncoderTests {
         // One ack is normal and not an error
         try encoder.processInstruction(.sectionAcknowledgement(streamID: 1))
         // A second ack is extra and must be an error (RFC 9204 § 4.4.1)
-        #expect(throws: QPACKEncoderError.unexpectedStreamAck) {
+        #expect(throws: QPACKError.DecoderInstructionError.unexpectedSectionAcknowledgment) {
             try encoder.processInstruction(.sectionAcknowledgement(streamID: 1))
         }
     }

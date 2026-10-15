@@ -177,14 +177,14 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
                 self = .init(state: .withoutDynamic(withoutDynamic))
                 return .emitConnectionError(.decoderInstructionWithoutDynamicTable)
             case .withDynamic(var withDynamic):
-                do {
+                do throws(QPACKError.DecoderInstructionError) {
                     try withDynamic.encoder.processInstruction(instruction)
                     self = .init(state: .withDynamic(withDynamic))
                     return nil
                 } catch {
                     // TODO: move to error state?
                     self = .init(state: .withDynamic(withDynamic))
-                    return .emitConnectionError(.invalidDecoderInstruction)
+                    return .emitConnectionError(.invalidDecoderInstruction(error))
                 }
             }
         }
@@ -474,7 +474,7 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
     mutating func receivedIncomingEncoderInstruction(
         _ instruction: QPACKEncoderInstruction
     ) -> IncomingEncoderInstructionAction? {
-        do {
+        do throws(QPACKError.EncoderInstructionError) {
             let i = try self.qpackDecoder.processInstruction(instruction)
             switch self.outboundDecoderInstructionQueue.writeDecoderInstruction(i) {
             case .sendDecoderInstruction(let instruction):
@@ -483,7 +483,7 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
                 return .none
             }
         } catch {
-            return .emitConnectionError(.invalidEncoderInstruction)
+            return .emitConnectionError(.invalidEncoderInstruction(error))
         }
     }
 

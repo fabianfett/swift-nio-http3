@@ -23,9 +23,6 @@ enum DynamicHeaderTableError: Error, Sendable, Hashable {
     case ackCountTooLow
     /// The acknowledged insert count has set to value which is too high to be valid.
     case ackCountTooHigh
-    /// The dynamic table current capacity was set to a value higher than the maximum capacity.
-    /// In practice, in HTTP3, this means we received a `Set Dynamic Table Capacity` instruction containing a value higher than the size we advertised in the settings frame.
-    case capacityTooHigh
 }
 
 struct DynamicTableLookupResult: Sendable, Hashable {
@@ -241,12 +238,9 @@ struct DynamicHeaderTable: Sendable {
     /// Set the size to which the dynamic table may currently grow. Represents
     /// the current maximum length signaled by the peer (RFC 9204 § 4.3.1).
     ///
-    /// - Note: This value cannot exceed `self.maximumCapacity`.
-    mutating func setCurrentCapacity(_ capacity: Int) throws {
-        guard capacity <= self.maximumCapacity else {
-            // This means the remote sent us a "set dynamic table capacity" instruction with a value higher than the value we sent in the SETTINGS frame.
-            throw DynamicHeaderTableError.capacityTooHigh
-        }
+    /// - Precondition: `capacity` must not exceed `self.maximumCapacity`.
+    mutating func setCurrentCapacity(_ capacity: Int) throws(HeaderTableError) {
+        precondition(capacity <= self.maximumCapacity, "Capacity \(capacity) exceeds \(self.maximumCapacity)")
         try self.storage.setTableSize(to: capacity, maximumEvictableAbsoluteIndex: self.maximumEvictableAbsoluteIndex)
     }
 

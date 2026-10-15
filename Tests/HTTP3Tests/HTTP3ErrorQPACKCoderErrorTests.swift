@@ -23,9 +23,12 @@ struct HTTP3ErrorQPACKCoderErrorTests {
     @Test(
         arguments: [
             (QPACKError.duplicateSettings, HTTP3Error.Code.unexpectedFrame, HTTP3ErrorCode.frameUnexpected),
-            (.invalidEncoderInstruction, .qpackEncoderStreamError, .qpackEncoderStreamError),
+            (.invalidEncoderInstruction(.capacityTooHigh), .qpackEncoderStreamError, .qpackEncoderStreamError),
             (.decoderInstructionWithoutDynamicTable, .qpackDecoderStreamError, .qpackDecoderStreamError),
-            (.invalidDecoderInstruction, .qpackDecoderStreamError, .qpackDecoderStreamError),
+            (
+                .invalidDecoderInstruction(.unexpectedSectionAcknowledgment), .qpackDecoderStreamError,
+                .qpackDecoderStreamError
+            ),
             (.invalidFieldSectionPrefix, .qpackDecoderError, .qpackDecompressionFailed),
             (.decodeError(.invalidFieldSection), .qpackDecoderError, .qpackDecompressionFailed),
             (.decodeError(.invalidReference), .qpackDecoderError, .qpackDecompressionFailed),
@@ -53,5 +56,11 @@ struct HTTP3ErrorQPACKCoderErrorTests {
     @Test func locationIsTheCallSite() {
         let location = HTTP3Error.SourceLocation.here()
         #expect(HTTP3Error(.tooManyBlockedStreams, location: location).location == location)
+    }
+
+    @Test func underlyingReasonIsKept() {
+        let error = HTTP3Error(.invalidEncoderInstruction(.entryTooLarge), location: .here())
+        #expect(error.cause as? QPACKError == .invalidEncoderInstruction(.entryTooLarge))
+        #expect(String(describing: error).contains("entryTooLarge"))
     }
 }
