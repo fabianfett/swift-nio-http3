@@ -14,7 +14,6 @@
 
 public import NIOQUICHelpers
 
-@_spi(PackageInternal)
 public enum QPACKReferenceTable: Sendable, Hashable {
     case staticTable
     case dynamicTable
@@ -29,7 +28,6 @@ public enum QPACKReferenceTable: Sendable, Hashable {
 }
 
 /// Encoder instructions from RFC 9204 § 4.3.
-@_spi(PackageInternal)
 public enum QPACKEncoderInstruction: Sendable, Hashable {
     /// 4.3.1. Set Dynamic Table Capacity.
     case setDynamicTableCapacity(Int)
@@ -42,7 +40,6 @@ public enum QPACKEncoderInstruction: Sendable, Hashable {
 }
 
 /// Decoder instructions from RFC 9204 § 4.4.
-@_spi(PackageInternal)
 public enum QPACKDecoderInstruction: Sendable, Hashable {
     /// 4.4.1. Section Acknowledgment.
     case sectionAcknowledgement(streamID: QUICStreamID)
