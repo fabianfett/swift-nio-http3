@@ -403,13 +403,8 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
                 }
             }
 
-        case .error(let qpackError):
-            switch self.errorTypeForDecoderError(qpackError) {
-            case .connection(let error):
-                return .emitConnectionError(error, context)
-            case .stream(let error):
-                return .informDecodeError(.init(error: error, streamID: streamID), context)
-            }
+        case .error(let decoderError):
+            return self.decodeErrorAction(decoderError, streamID: streamID, context: context)
         }
     }
 
@@ -428,13 +423,8 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
         case .missingInsertCount:
             // This implies a bug in `popIfDecodable` because we shouldn't get here if something isn't decodable yet
             fatalError("Tried to decode an entry which can't be decoded")
-        case .error(let qpackError):
-            switch self.errorTypeForDecoderError(qpackError) {
-            case .connection(let error):
-                return .emitConnectionError(error, entry.context)
-            case .stream(let error):
-                return .informDecodeError(.init(error: error, streamID: entry.streamID), entry.context)
-            }
+        case .error(let decoderError):
+            return self.decodeErrorAction(decoderError, streamID: entry.streamID, context: entry.context)
         case .success(let fields, let instruction):
             let writeAction = instruction.flatMap { self.outboundDecoderInstructionQueue.writeDecoderInstruction($0) }
             switch writeAction {
@@ -460,22 +450,16 @@ struct QPACKStateMachine<DecodeContext>: ~Copyable {
         }
     }
 
-    private enum ErrorType {
-        case connection(QPACKError)
-        case stream(QPACKError)
-    }
-
-    private func errorTypeForDecoderError(_ error: QPACKDecoderError) -> ErrorType {
-        switch error {
-        case .invalidFieldSection, .invalidReference:
-            // If the decoder encounters a reference in a field line representation to a dynamic table entry that has
-            // already been evicted or that has an absolute index greater than or equal to the declared Required
-            // Insert Count (Section 4.5.1), it MUST treat this as a connection error of type QPACK_DECOMPRESSION_FAILED.
-            return .connection(.invalidFieldSection)
-        case .invalidHeaderName:
-            // Here we did decode fine, but the header is not valid in HTTP/3 (e.g. it isn't lower case)
-            // This is a malformed message, a stream level error. Not a connection error
-            return .stream(.invalidFieldName)
+    private func decodeErrorAction(
+        _ decoderError: QPACKDecoderError,
+        streamID: QUICStreamID,
+        context: DecodeContext
+    ) -> DecodeHeaderAction {
+        let error = QPACKError.decodeError(decoderError)
+        if error.isConnectionError {
+            return .emitConnectionError(error, context)
+        } else {
+            return .informDecodeError(.init(error: error, streamID: streamID), context)
         }
     }
 

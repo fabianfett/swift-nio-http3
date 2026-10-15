@@ -15,7 +15,7 @@
 public import HTTPTypes
 public import NIOQUICHelpers
 
-@_spi(PackageInternal)
+// TODO: This might need an `@nonexhaustive`
 public enum QPACKDecoderError: Error, Sendable, Hashable {
     case invalidHeaderName
     case invalidReference

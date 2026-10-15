@@ -482,7 +482,11 @@ extension HTTP3StreamHandler: QPACKDecodeReceiver {
         case .success(let fields):
             self.onQPACKDecodeResult(fields: fields)
         case .failure(let error):
-            self.onQPACKDecodeError(HTTP3Error(error, streamID: self.streamID))
+            let h3Error = HTTP3Error(error, streamID: self.streamID, location: .here())
+            if error.isConnectionError {
+                self.delegate.onConnectionError(h3Error)
+            }
+            self.onQPACKDecodeError(h3Error)
         }
     }
 }

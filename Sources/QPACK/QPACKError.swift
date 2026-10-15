@@ -15,9 +15,8 @@
 /// Why the ``QPACKCoder`` failed.
 ///
 /// The owner of the coder translates this into the error type of the protocol it runs QPACK for. Whether a failure
-/// takes down the connection or only the stream it happened on is up to the coder: see
-/// ``QPACKConnectionDelegate/connectionError(_:)`` and ``QPACKDecodeReceiver/decodeResult(_:)``.
-@_spi(PackageInternal)
+/// takes down the connection or only the stream it happened on is given by ``isConnectionError``.
+@nonexhaustive
 public enum QPACKError: Error, Sendable, Hashable {
     /// The peer sent its settings more than once.
     case duplicateSettings
@@ -34,13 +33,28 @@ public enum QPACKError: Error, Sendable, Hashable {
     /// The prefix of a field section could not have been produced by a conformant encoder (RFC 9204 § 4.5.1.1).
     case invalidFieldSectionPrefix
 
-    /// A field section refers to a dynamic table entry which doesn't exist (RFC 9204 § 2.2.3).
-    case invalidFieldSection
+    /// A field section could not be decoded.
+    case decodeError(QPACKDecoderError)
 
     /// More streams are blocked waiting for dynamic table entries than were promised.
     case tooManyBlockedStreams
 
-    /// A field section was decoded, but its field names are not valid in HTTP/3, such as upper case ones. The
-    /// message is malformed, but the connection is not at fault.
-    case invalidFieldName
+    /// Whether the failure is fatal to the connection, rather than only to the stream it happened on.
+    ///
+    /// Everything which may leave the two dynamic tables out of sync is a connection error. The only stream error
+    /// is a field section which decoded fine, but whose field names are not valid in HTTP/3, such as upper case
+    /// ones: the message is malformed, but the connection is not at fault.
+    public var isConnectionError: Bool {
+        switch self {
+        case .decodeError(.invalidHeaderName):
+            return false
+        case .duplicateSettings, .invalidEncoderInstruction, .decoderInstructionWithoutDynamicTable,
+            .invalidDecoderInstruction, .invalidFieldSectionPrefix, .decodeError(.invalidReference),
+            .decodeError(.invalidFieldSection), .tooManyBlockedStreams:
+            // RFC 9204 § 2.2.3: a reference to a dynamic table entry that has already been evicted or that has an
+            // absolute index greater than or equal to the declared Required Insert Count MUST be treated as a
+            // connection error of type QPACK_DECOMPRESSION_FAILED.
+            return true
+        }
+    }
 }

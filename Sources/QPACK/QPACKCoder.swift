@@ -19,7 +19,6 @@ public import NIOQUICHelpers
 ///
 /// This is the unidirectional QPACK encoder stream of RFC 9204 § 4.2.1. It only exists if the peer's settings
 /// permit the dynamic table. Create it in response to ``ConnectionDelegate/makeOutboundEncoderStream()``.
-@_spi(PackageInternal)
 public protocol QPACKOutboundEncoderStream: ~Copyable {
     /// Write instructions to the stream, in the order given.
     mutating func sendInstructions(_ instructions: some Collection<QPACKEncoderInstruction>)
@@ -29,7 +28,6 @@ public protocol QPACKOutboundEncoderStream: ~Copyable {
 ///
 /// This is the unidirectional QPACK decoder stream of RFC 9204 § 4.2.2. Unlike the encoder stream it always
 /// exists, but the coder buffers instructions until ``QPACKCoder/outboundDecoderStreamReady(_:)`` is called.
-@_spi(PackageInternal)
 public protocol QPACKOutboundDecoderStream: ~Copyable {
     /// Write an instruction to the stream.
     mutating func sendInstruction(_ instruction: QPACKDecoderInstruction)
@@ -38,12 +36,8 @@ public protocol QPACKOutboundDecoderStream: ~Copyable {
     mutating func sendInstructions(_ instruction: some Collection<QPACKDecoderInstruction>)
 }
 
-/// An object representing an HTTP3Connection to forward connection level errors to.
-@_spi(PackageInternal)
+/// An object representing an HTTP3Connection, which opens the outbound encoder stream on request.
 public protocol QPACKConnectionDelegate {
-    /// Tear the connection down.
-    func connectionError(_ error: QPACKError)
-
     /// Open a unidirectional `HTTP3StreamType.Unidirectional.qpackEncoder` stream and pass it to
     /// ``QPACKCoder/outboundEncoderStreamReady(_:)``.
     ///
@@ -54,7 +48,6 @@ public protocol QPACKConnectionDelegate {
 
 /// An object that is interested in the async QPACK decode result. In most cases this will be an object representing
 /// a HTTP3 stream.
-@_spi(PackageInternal)
 public protocol QPACKDecodeReceiver {
     /// Inform the QPACKDecodeReceiver that a decode has happened.
     ///
@@ -62,8 +55,8 @@ public protocol QPACKDecodeReceiver {
     /// ``QPACKCoder/requestStreamClosed(streamID:seenEOF:)`` with `seenEOF: false` while the decode is still
     /// blocked, in which case the pending decode is dropped and this is never called.
     ///
-    /// A failure isn't necessarily confined to this stream: some QPACK failures are fatal to the connection, and
-    /// the ``ConnectionDelegate`` is given the same error.
+    /// A failure isn't necessarily confined to this stream: if ``QPACKCoderError/isConnectionError`` is `true` the
+    /// receiver must tear down the connection. The coder doesn't report it anywhere else.
     ///
     /// - Important: If the decoder has all the necessary QPACK decode information available the decoder
     ///              will invoke this method syncronously from
@@ -89,14 +82,14 @@ public protocol QPACKDecodeReceiver {
 ///    ``outboundEncoderStreamReady(_:)``. Until then — and forever, if either side put the table size at zero —
 ///    encoding uses the static table only.
 ///
-/// Failures come in two kinds: a malformed message fails only its own stream, via that stream's
-/// ``QPACKDecodeReceiver``, while anything that leaves the two dynamic tables out of sync is fatal to the
-/// connection and goes to the ``ConnectionDelegate`` as well as to the receiver.
+/// Failures are reported to whoever caused them: methods called for input from the peer's control, encoder and
+/// decoder streams throw, and failures to decode a field section go to that stream's ``QPACKDecodeReceiver``. Each
+/// ``QPACKCoderError`` says whether it is fatal to the connection, and it is up to the caller to tear the connection
+/// down.
 ///
 /// - Note: This object retains its ``ConnectionDelegate``. If the object holding the QPACKCoder is also its
 ///   ``ConnectionDelegate`` (likely the HTTP3Connection), the two keep each other alive: the holder must drop
 ///   its reference to the coder to break the cycle.
-@_spi(PackageInternal)
 public final class QPACKCoder<
     OutboundEncoderStream: QPACKOutboundEncoderStream & ~Copyable,
     OutboundDecoderStream: QPACKOutboundDecoderStream & ~Copyable,
@@ -133,13 +126,12 @@ public final class QPACKCoder<
     ///   - decoderMaxTableSize: Maximum size in bytes of this endpoint's dynamic table. `0` refuses it entirely.
     ///   - decoderMaxBlockedStreams: How many streams may be blocked at once waiting for entries which haven't
     ///     arrived on the peer's encoder stream yet. Exceeding this is a connection error.
-    ///   - errorDelegate: Receives connection level errors and the request for an outbound encoder stream.
+    ///   - errorDelegate: Receives the request for an outbound encoder stream.
     ///
     /// - Important:
     ///   The two decoder limits describe what this endpoint's decoder accepts from the peer's encoder, so they must
     ///   match the `SETTINGS_QPACK_MAX_TABLE_CAPACITY` and `SETTINGS_QPACK_BLOCKED_STREAMS` this endpoint
     ///   advertises when sending its own SETTINGS frame.
-    @_spi(PackageInternal)
     public init(
         encoderMaxTableSize: Int,
         decoderMaxTableSize: Int,
@@ -164,16 +156,16 @@ public final class QPACKCoder<
     /// be used. See RFC 9204 § 4.2.
     ///
     /// - Important: The peer may only send SETTINGS once. Calling this a second time leaves the coder's state
-    ///   untouched and reports an `H3_FRAME_UNEXPECTED` connection error to the ``ConnectionDelegate``.
+    ///   untouched and throws ``QPACKCoderError/duplicateSettings``.
     ///
     /// - Parameters:
     ///   - maxQueueSize: The peer's `SETTINGS_QPACK_BLOCKED_STREAMS`.
     ///   - peersDynamicTableSize: The peer's `SETTINGS_QPACK_MAX_TABLE_CAPACITY`.
-    @_spi(PackageInternal)
+    /// - Throws: A connection error.
     public func receivedRemoteSettings(
         maxQueueSize: Int,
         peersDynamicTableSize: Int
-    ) {
+    ) throws(QPACKError) {
         let action = self.stateMachine.receivedRemoteSettings(
             maxQueueSize: maxQueueSize,
             effectiveDynamicTableSize: min(self.encoderMaxTableSize, peersDynamicTableSize)
@@ -183,7 +175,7 @@ public final class QPACKCoder<
         case .makeEncoderInstructionStream:
             self.connection.makeOutboundEncoderStream()
         case .emitConnectionError(let error):
-            self.connection.connectionError(error)
+            throw error
         case .none:
             break
         }
@@ -223,7 +215,6 @@ public final class QPACKCoder<
     ///
     /// - Precondition: Call this only after ``ConnectionDelegate/makeOutboundEncoderStream()`` asked for the
     ///   stream, and only once.
-    @_spi(PackageInternal)
     public func outboundEncoderStreamReady(_ stream: consuming OutboundEncoderStream) {
         self.outboundEncoderStream = consume stream
 
@@ -238,14 +229,17 @@ public final class QPACKCoder<
     /// Call this method when an instruction has been received on the peer's QPACK decoder stream.
     ///
     /// Section acknowledgements, stream cancellations and insert count increments tell this endpoint's encoder
-    /// which of its dynamic table entries the peer has seen, which is what lets the encoder evict them. An
-    /// instruction received while the dynamic table isn't in use, or one that doesn't match the encoder's state,
-    /// is a `QPACK_DECODER_STREAM_ERROR` connection error.
-    @_spi(PackageInternal)
-    public func receivedIncomingDecoderInstruction(_ instruction: QPACKDecoderInstruction) {
+    /// which of its dynamic table entries the peer has seen, which is what lets the encoder evict them.
+    ///
+    /// - Throws: A connection error: ``QPACKCoderError/decoderInstructionWithoutDynamicTable`` if the dynamic table
+    ///   isn't in use, or ``QPACKCoderError/invalidDecoderInstruction`` if the instruction doesn't match the
+    ///   encoder's state.
+    public func receivedIncomingDecoderInstruction(
+        _ instruction: QPACKDecoderInstruction
+    ) throws(QPACKError) {
         switch self.stateMachine.receivedIncomingDecoderInstruction(instruction) {
         case .emitConnectionError(let error):
-            self.connection.connectionError(error)
+            throw error
         case .none:
             break
         }
@@ -302,19 +296,21 @@ public final class QPACKCoder<
     ///
     /// These instructions maintain this endpoint's dynamic table. Applying one can unblock any number of waiting
     /// field sections, and each of their ``QPACKDecodeReceiver``s is called synchronously from here, in ascending
-    /// order of required insert count. An instruction the decoder can't apply is a `QPACK_ENCODER_STREAM_ERROR`
-    /// connection error.
+    /// order of required insert count.
+    ///
+    /// - Throws: ``QPACKCoderError/invalidEncoderInstruction``, a connection error, if the decoder can't apply the
+    ///   instruction. No blocked field sections are decoded then.
     @_spi(PackageInternal)
     public func receivedIncomingEncoderInstruction(
         _ instruction: QPACKEncoderInstruction
-    ) {
+    ) throws(QPACKError) {
         let action = self.stateMachine.receivedIncomingEncoderInstruction(instruction)
         switch action {
         case .sendDecoderInstruction(let qPACKDecoderInstruction):
             // Safe to unwrap: see `outboundDecoderStream`.
             self.outboundDecoderStream!.sendInstruction(qPACKDecoderInstruction)
         case .emitConnectionError(let error):
-            self.connection.connectionError(error)
+            throw error
         case .none:
             break
         }
@@ -338,7 +334,7 @@ public final class QPACKCoder<
             receiver.decodeResult(.failure(informDecodeError.error))
 
         case .emitConnectionError(let error, let receiver):
-            self.connection.connectionError(error)
+            // The receiver tears the connection down: the error says it is a connection error.
             receiver.decodeResult(.failure(error))
 
         case .none:

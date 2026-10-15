@@ -62,30 +62,13 @@ final class TestDelegate: HTTP3StreamDelegate {
 
 /// A mock ``QPACKConnectionDelegate`` for tests which exercise ``HTTP3StreamHandler`` in isolation.
 final class TestQPACKConnectionDelegate: QPACK.QPACKConnectionDelegate {
-
-    static func makeUnexpectedQPACKConnectionErrorHandler() -> (HTTP3Error) -> Void {
-        { error in
-            Issue.record("Unexpected QPACK connection error \(error)")
-        }
-    }
-
-    let _connectionError: (HTTP3Error) -> Void
     let _makeOutboundEncoderStream: () -> Void
 
     /// The number of times the coder asked for an outbound encoder stream.
     private(set) var madeOutboundEncoderStreamCount = 0
 
-    init(
-        onConnectionError: @escaping (HTTP3Error) -> Void =
-            TestQPACKConnectionDelegate.makeUnexpectedQPACKConnectionErrorHandler(),
-        onMakeOutboundEncoderStream: @escaping () -> Void = {}
-    ) {
-        self._connectionError = onConnectionError
+    init(onMakeOutboundEncoderStream: @escaping () -> Void = {}) {
         self._makeOutboundEncoderStream = onMakeOutboundEncoderStream
-    }
-
-    func connectionError(_ error: QPACKError) {
-        self._connectionError(HTTP3Error(error))
     }
 
     func makeOutboundEncoderStream() {
@@ -204,17 +187,21 @@ struct NIOHTTP3StreamHandlerTests {
     @available(anyAppleOS 26.0, *)
     @Test func receiveInvalidHeaders() throws {
         var errorReceived = false
-        let qpackDelegate = TestQPACKConnectionDelegate(onConnectionError: { error in
+        // The coder leaves it to the stream to tear down the connection.
+        let delegate = TestDelegate(onConnectionError: { error in
             errorReceived = true
             #expect(error.code == .qpackDecoderError)
             #expect(error.h3ErrorCode == .qpackDecompressionFailed)
+            #expect(error.message == "Could not decode QPACK headers for stream 5")
+            #expect(error.cause as? QPACKError == .decodeError(.invalidReference))
+            #expect(error.location.file.hasSuffix("HTTP3StreamHandler.swift"))
         })
         let handler = HTTP3StreamHandler(
             stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
             streamID: 5,
             streamType: .request,
-            qpackCoder: makeTestQPACKCoder(connectionDelegate: qpackDelegate),
-            delegate: TestDelegate(),
+            qpackCoder: makeTestQPACKCoder(),
+            delegate: delegate,
             logger: self.logger
         )
         let eventLoop = EmbeddedEventLoop()
@@ -243,7 +230,7 @@ struct NIOHTTP3StreamHandlerTests {
         let decoderStreamChannel = EmbeddedChannel()
         let qpackCoder = makeTestQPACKCoder(decoderStreamChannel: decoderStreamChannel)
         // The peer's encoder may use a dynamic table, but hasn't inserted anything into it yet.
-        qpackCoder.receivedIncomingEncoderInstruction(.setDynamicTableCapacity(1024))
+        try qpackCoder.receivedIncomingEncoderInstruction(.setDynamicTableCapacity(1024))
         #expect(try decoderStreamChannel.readOutbound(as: ByteBuffer.self) == nil)
 
         let handler = HTTP3StreamHandler(
@@ -269,7 +256,7 @@ struct NIOHTTP3StreamHandlerTests {
         #expect(seenEvents.isEmpty())
 
         // The missing entry arrives on the peer's encoder stream, which unblocks the decode.
-        qpackCoder.receivedIncomingEncoderInstruction(self.testUnblockingEncoderInstruction)
+        try qpackCoder.receivedIncomingEncoderInstruction(self.testUnblockingEncoderInstruction)
 
         // Make sure we read the right value
         guard let readFrameAny = seenEvents.popFirst()?.readValue else {

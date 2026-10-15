@@ -21,9 +21,10 @@ extension HTTP3Error {
     /// - Parameters:
     ///   - error: The failure of the coder.
     ///   - streamID: The stream the failure happened on, if it is known.
-    ///   - location: Where the error is created.
+    ///   - location: Where in the HTTP/3 stack the failure was reported. The coder can't record this, so pass
+    ///     `.here()` at the call site.
     @_spi(PackageInternal)
-    public init(_ error: QPACKError, streamID: QUICStreamID? = nil, location: SourceLocation = .here()) {
+    public init(_ error: QPACKError, streamID: QUICStreamID? = nil, location: SourceLocation) {
         switch error {
         case .duplicateSettings:
             // RFC 9114 § 7.2.4: the peer may only send SETTINGS once, and a second one is a connection error.
@@ -66,7 +67,7 @@ extension HTTP3Error {
                 errorCode: .qpackDecompressionFailed,
                 location: location
             )
-        case .invalidFieldSection:
+        case .decodeError(.invalidFieldSection), .decodeError(.invalidReference):
             self.init(
                 code: .qpackDecoderError,
                 message: streamID.map { "Could not decode QPACK headers for stream \($0)" }
@@ -83,7 +84,8 @@ extension HTTP3Error {
                 errorCode: .qpackDecompressionFailed,
                 location: location
             )
-        case .invalidFieldName:
+        case .decodeError(.invalidHeaderName):
+            // The field section decoded fine, but a field name isn't valid in HTTP/3: a malformed message.
             self.init(
                 code: .qpackDecoderError,
                 message: "Could not decode QPACK headers",

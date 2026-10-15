@@ -218,7 +218,7 @@ struct QPACKStateMachineTests {
             Issue.record("Unexpected actions \(String(describing: action2))")
             return
         }
-        #expect(error == .invalidFieldSection)
+        #expect(error == .decodeError(.invalidReference))
         #expect(context == contextID)
     }
 
@@ -242,7 +242,7 @@ struct QPACKStateMachineTests {
             return
         }
         #expect(error.streamID == streamID)
-        #expect(error.error == .invalidFieldName)
+        #expect(error.error == .decodeError(.invalidHeaderName))
         #expect(context == contextID)
     }
 
@@ -320,7 +320,7 @@ struct QPACKStateMachineTests {
             return
         }
         #expect(decodeError.streamID == streamID)
-        #expect(decodeError.error == .invalidFieldName)
+        #expect(decodeError.error == .decodeError(.invalidHeaderName))
         #expect(context == contextID)
     }
 

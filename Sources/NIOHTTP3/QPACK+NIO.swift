@@ -32,27 +32,25 @@ typealias NIOQPACKCoder<
     HTTP3StreamHandler<StreamDelegate, ConnectionDelegate>
 >
 
-/// Gives the instructions read from the peer's QPACK streams to the ``QPACKCoder``.
-///
-/// Failing to read the streams isn't a failure of the coder, so these errors are reported as the ``HTTP3Error`` they
-/// are, with all the details the stream handlers know about.
+/// Gives the instructions read from the peer's QPACK streams to the ``QPACKCoder``, and reports any failure to read
+/// or apply them to the connection.
 @available(anyAppleOS 26.0, *)
 struct QPACKInboundStreamDelegate<
     ConnectionDelegate: QPACK.QPACKConnectionDelegate,
     StreamDelegate: HTTP3StreamDelegate
 >: QPACKInboundEncoderStreamDelegate, QPACKInboundDecoderStreamDelegate {
     let qpackCoder: NIOQPACKCoder<ConnectionDelegate, StreamDelegate>
-    let reportError: (HTTP3Error) -> Void
+    let connection: StreamDelegate
 
-    func onReceivedInstruction(_ instruction: QPACKEncoderInstruction) {
-        self.qpackCoder.receivedIncomingEncoderInstruction(instruction)
+    func onReceivedInstruction(_ instruction: QPACKEncoderInstruction) throws(QPACKError) {
+        try self.qpackCoder.receivedIncomingEncoderInstruction(instruction)
     }
 
-    func onReceivedInstruction(_ instruction: QPACKDecoderInstruction) {
-        self.qpackCoder.receivedIncomingDecoderInstruction(instruction)
+    func onReceivedInstruction(_ instruction: QPACKDecoderInstruction) throws(QPACKError) {
+        try self.qpackCoder.receivedIncomingDecoderInstruction(instruction)
     }
 
     func onError(_ error: HTTP3Error) {
-        self.reportError(error)
+        self.connection.onConnectionError(error)
     }
 }
