@@ -116,11 +116,7 @@ struct QPACKCoderTests {
         coder.receivedRemoteSettings(maxQueueSize: 100, peersDynamicTableSize: 4096)
 
         #expect(connection.errors.count == 1)
-        expectH3ErrorEqual(
-            error: connection.errors.first,
-            expectedCode: .unexpectedFrame,
-            expectedH3ErrorCode: .frameUnexpected
-        )
+        #expect(connection.errors.first == .duplicateSettings)
         // The first settings still stand: no second encoder stream, and the table keeps its original size.
         #expect(connection.madeOutboundEncoderStreamCount == 1)
         let encoderStream = TestOutboundEncoderStream()
@@ -139,11 +135,7 @@ struct QPACKCoderTests {
         coder.receivedRemoteSettings(maxQueueSize: 100, peersDynamicTableSize: 300)
 
         #expect(connection.errors.count == 1)
-        expectH3ErrorEqual(
-            error: connection.errors.first,
-            expectedCode: .unexpectedFrame,
-            expectedH3ErrorCode: .frameUnexpected
-        )
+        #expect(connection.errors.first == .duplicateSettings)
         #expect(connection.madeOutboundEncoderStreamCount == 0)
     }
 
@@ -414,11 +406,7 @@ struct QPACKCoderTests {
         coder.decodeFields(headers, streamID: 0, decodeReceiver: receiver)
 
         #expect(receiver.results.count == 1)
-        expectH3ErrorEqual(
-            error: receiver.errors.first,
-            expectedCode: .qpackDecoderError,
-            expectedH3ErrorCode: .messageError
-        )
+        #expect(receiver.errors.first == .decodeError(.invalidHeaderName))
         // A stream level error must not take down the connection.
         #expect(connection.errors.isEmpty)
     }
@@ -437,17 +425,9 @@ struct QPACKCoderTests {
         )
         coder.decodeFields(headers, streamID: 0, decodeReceiver: receiver)
 
-        expectH3ErrorEqual(
-            error: connection.errors.first,
-            expectedCode: .qpackDecoderError,
-            expectedH3ErrorCode: .qpackDecompressionFailed
-        )
+        #expect(connection.errors.first == .decodeError(.invalidReference))
         // The stream is told about the failure too, so that it doesn't wait for a result which will never come.
-        expectH3ErrorEqual(
-            error: receiver.errors.first,
-            expectedCode: .qpackDecoderError,
-            expectedH3ErrorCode: .qpackDecompressionFailed
-        )
+        #expect(receiver.errors.first == .decodeError(.invalidReference))
     }
 
     @Test func invalidFieldSectionPrefixIsAConnectionError() {
@@ -465,12 +445,7 @@ struct QPACKCoderTests {
         )
         coder.decodeFields(headers, streamID: 0, decodeReceiver: receiver)
 
-        expectH3ErrorEqual(
-            error: connection.errors.first,
-            expectedCode: .qpackDecoderError,
-            expectedH3ErrorCode: .qpackDecompressionFailed,
-            expectedMessage: "Invalid field section prefix"
-        )
+        #expect(connection.errors.first == .invalidFieldSectionPrefix)
         #expect(receiver.errors.count == 1)
     }
 
@@ -494,12 +469,7 @@ struct QPACKCoderTests {
         // RFC 9204 § 2.1.2: more blocked streams than promised is a connection error.
         let receiver2 = TestDecodeReceiver()
         coder.decodeFields(headers, streamID: 2, decodeReceiver: receiver2)
-        expectH3ErrorEqual(
-            error: connection.errors.first,
-            expectedCode: .qpackDecoderError,
-            expectedH3ErrorCode: .qpackDecompressionFailed,
-            expectedMessage: "Too many streams blocked on QPACK"
-        )
+        #expect(connection.errors.first == .tooManyBlockedStreams)
         #expect(receiver2.errors.count == 1)
     }
 
@@ -512,11 +482,7 @@ struct QPACKCoderTests {
         // Invalid because it exceeds the capacity we advertised.
         coder.receivedIncomingEncoderInstruction(.setDynamicTableCapacity(1025))
 
-        expectH3ErrorEqual(
-            error: connection.errors.first,
-            expectedCode: .qpackEncoderStreamError,
-            expectedH3ErrorCode: .qpackEncoderStreamError
-        )
+        #expect(connection.errors.first == .invalidEncoderInstruction)
     }
 
     @Test func incomingDecoderInstructionIsForwardedToTheEncoder() {
@@ -541,11 +507,7 @@ struct QPACKCoderTests {
         // We never opened an encoder stream, so the peer's decoder has nothing to acknowledge.
         coder.receivedIncomingDecoderInstruction(.sectionAcknowledgement(streamID: 1))
 
-        expectH3ErrorEqual(
-            error: connection.errors.first,
-            expectedCode: .qpackDecoderStreamError,
-            expectedH3ErrorCode: .qpackDecoderStreamError
-        )
+        #expect(connection.errors.first == .decoderInstructionWithoutDynamicTable)
     }
 
     // MARK: Stream management
@@ -625,10 +587,10 @@ private final class TestOutboundDecoderStream: QPACKOutboundDecoderStream {
 
 /// Records the connection level side effects: errors and requests to open an encoder stream.
 private final class TestConnection: HTTP3.QPACKConnectionDelegate {
-    var errors: [HTTP3Error] = []
+    var errors: [QPACKError] = []
     var madeOutboundEncoderStreamCount = 0
 
-    func connectionError(_ error: HTTP3Error) {
+    func connectionError(_ error: QPACKError) {
         self.errors.append(error)
     }
 
@@ -639,7 +601,7 @@ private final class TestConnection: HTTP3.QPACKConnectionDelegate {
 
 /// Records the decode results delivered to a single stream.
 private final class TestDecodeReceiver: QPACKDecodeReceiver {
-    var results: [Result<[HTTPField], HTTP3Error>] = []
+    var results: [Result<[HTTPField], QPACKError>] = []
 
     /// The fields from all successful decodes, in order.
     var decodedFields: [[HTTPField]] {
@@ -652,7 +614,7 @@ private final class TestDecodeReceiver: QPACKDecodeReceiver {
     }
 
     /// The errors from all failed decodes, in order.
-    var errors: [HTTP3Error] {
+    var errors: [QPACKError] {
         self.results.compactMap {
             switch $0 {
             case .success: return nil
@@ -661,7 +623,7 @@ private final class TestDecodeReceiver: QPACKDecodeReceiver {
         }
     }
 
-    func decodeResult(_ result: Result<[HTTPField], HTTP3Error>) {
+    func decodeResult(_ result: Result<[HTTPField], QPACKError>) {
         self.results.append(result)
     }
 }

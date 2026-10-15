@@ -42,8 +42,8 @@ public protocol QPACKOutboundDecoderStream: ~Copyable {
 /// An object representing an HTTP3Connection to forward connection level errors to.
 @_spi(PackageInternal)
 public protocol QPACKConnectionDelegate {
-    /// Tear the connection down. The error's ``HTTP3Error/h3ErrorCode`` is the code to close it with.
-    func connectionError(_ error: HTTP3Error)
+    /// Tear the connection down.
+    func connectionError(_ error: QPACKError)
 
     /// Open a unidirectional ``HTTP3StreamType/Unidirectional/qpackEncoder`` stream and pass it to
     /// ``QPACKCoder/outboundEncoderStreamReady(_:)``.
@@ -69,7 +69,7 @@ public protocol QPACKDecodeReceiver {
     /// - Important: If the decoder has all the necessary QPACK decode information available the decoder
     ///              will invoke this method syncronously from
     ///              ``QPACKCoder/decodeFields(_:streamID:decodeReceiver:)``.
-    func decodeResult(_ result: Result<[HTTPField], HTTP3Error>)
+    func decodeResult(_ result: Result<[HTTPField], QPACKError>)
 }
 
 /// An object encapsulating all the QPACK encoding and decoding. It implements the QPACK procedures while being
@@ -314,8 +314,8 @@ public final class QPACKCoder<
         case .sendDecoderInstruction(let qPACKDecoderInstruction):
             // Safe to unwrap: see `outboundDecoderStream`.
             self.outboundDecoderStream!.sendInstruction(qPACKDecoderInstruction)
-        case .emitConnectionError(let http3Error):
-            self.connection.connectionError(http3Error)
+        case .emitConnectionError(let error):
+            self.connection.connectionError(error)
         case .none:
             break
         }
@@ -338,9 +338,9 @@ public final class QPACKCoder<
         case .informDecodeError(let informDecodeError, let receiver):
             receiver.decodeResult(.failure(informDecodeError.error))
 
-        case .emitConnectionError(let http3Error, let receiver):
-            self.connection.connectionError(http3Error)
-            receiver.decodeResult(.failure(http3Error))
+        case .emitConnectionError(let error, let receiver):
+            self.connection.connectionError(error)
+            receiver.decodeResult(.failure(error))
 
         case .none:
             // the required encoder dynamic table update hasn't arrived yet.

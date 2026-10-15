@@ -17,6 +17,7 @@ import HTTPTypes
 import Logging
 import NIOCore
 import NIOQUICHelpers
+@_spi(PackageInternal) import QPACK
 
 /// This is an internal protocol that shall only be implemented by HTTP3ConnectionCoordinator
 /// It exists to enable testing of `HTTP3StreamHandler` in isolation.
@@ -476,12 +477,12 @@ final class HTTP3StreamHandler<Delegate: HTTP3StreamDelegate, ConnectionDelegate
 
 @available(anyAppleOS 26.0, *)
 extension HTTP3StreamHandler: QPACKDecodeReceiver {
-    func decodeResult(_ result: Result<[HTTPField], HTTP3Error>) {
+    func decodeResult(_ result: Result<[HTTPField], QPACKError>) {
         switch result {
         case .success(let fields):
             self.onQPACKDecodeResult(fields: fields)
         case .failure(let error):
-            self.onQPACKDecodeError(error)
+            self.onQPACKDecodeError(HTTP3Error(error, streamID: self.streamID, location: .here()))
         }
     }
 }

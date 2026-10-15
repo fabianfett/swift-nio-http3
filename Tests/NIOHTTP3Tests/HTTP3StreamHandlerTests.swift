@@ -84,8 +84,8 @@ final class TestQPACKConnectionDelegate: HTTP3.QPACKConnectionDelegate {
         self._makeOutboundEncoderStream = onMakeOutboundEncoderStream
     }
 
-    func connectionError(_ error: HTTP3Error) {
-        self._connectionError(error)
+    func connectionError(_ error: QPACKError) {
+        self._connectionError(HTTP3Error(error, location: .here()))
     }
 
     func makeOutboundEncoderStream() {
