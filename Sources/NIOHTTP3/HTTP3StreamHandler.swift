@@ -269,10 +269,17 @@ final class HTTP3StreamHandler<Delegate: HTTP3StreamDelegate, ConnectionDelegate
             context.fireErrorCaught(error)
             promise?.fail(error)
         case .encodeHeaders(let fields):
-            let encoded = HTTP3PartialFrame.Headers(
-                fieldSection: self.qpackCoder.encodeHeaders(fields, streamID: self.streamID)
-            )
-            let action = self.stateMachine.gotHeaderEncodeResult(encoded, into: &self.pendingBytes!)
+            let action = self.stateMachine.writeHeadersFrame(
+                maxPayloadLength: self.qpackCoder.maxEncodedLength(of: fields),
+                into: &self.pendingBytes!
+            ) { output, preferHuffmanEncoding in
+                self.qpackCoder.encodeHeaders(
+                    fields,
+                    streamID: self.streamID,
+                    into: &output,
+                    preferHuffmanEncoding: preferHuffmanEncoding
+                )
+            }
 
             switch action {
             case .previousError(let previousError):
