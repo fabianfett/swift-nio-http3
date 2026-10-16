@@ -84,15 +84,13 @@ extension ByteBuffer {
         let start = self.writerIndex
         self.writeWithOutputRawSpan(
             minimumWritableBytes: QPACKEncodedLength.maxString(byteCount: string.utf8.count, prefix: prefix)
-        ) { output in
-            string.withContiguousUTF8 {
-                output.appendQPACKEncodedString(
-                    $0,
-                    preferHuffmanEncoding: preferHuffmanEncoding,
-                    prefix: prefix,
-                    prefixBits: prefixBits
-                )
-            }
+        ) {
+            $0.appendQPACKEncodedString(
+                string,
+                preferHuffmanEncoding: preferHuffmanEncoding,
+                prefix: prefix,
+                prefixBits: prefixBits
+            )
         }
         return self.writerIndex &- start
     }
@@ -149,6 +147,26 @@ extension OutputRawSpan {
         // So the prefix is reduced by one
         self.appendQPACKPrefixedInteger(bytes.count, prefix: prefix - 1, prefixBits: prefixBits)
         self.appendBytes(bytes)
+    }
+
+    /// Appends a string literal, encoded as in RFC 9204 § 4.1.2.
+    ///
+    /// - Precondition: The span has room for ``QPACKEncodedLength/maxString(byteCount:prefix:)`` more bytes.
+    @available(anyAppleOS 27, *)
+    mutating func appendQPACKEncodedString(
+        _ string: String,
+        preferHuffmanEncoding: Bool,
+        prefix: Int,
+        prefixBits: UInt8 = 0
+    ) {
+        string.withContiguousUTF8 {
+            self.appendQPACKEncodedString(
+                $0,
+                preferHuffmanEncoding: preferHuffmanEncoding,
+                prefix: prefix,
+                prefixBits: prefixBits
+            )
+        }
     }
 
     /// Appends `bytes` as they are.

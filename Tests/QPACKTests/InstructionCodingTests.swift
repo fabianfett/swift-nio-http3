@@ -186,3 +186,28 @@ struct InstructionCodingTests {
         #expect(decoded == .insertCountIncrement(increment: 55))
     }
 }
+
+extension ByteBuffer {
+    /// Appends `instruction` through an `OutputRawSpan`, and checks that it takes no more room than
+    /// ``QPACKEncodedLength/maxEncoderInstruction(_:)`` promises.
+    @available(anyAppleOS 27, *)
+    mutating func writeQPACKEncoderInstruction(_ instruction: QPACKEncoderInstruction, preferHuffmanEncoding: Bool) {
+        let bound = QPACKEncodedLength.maxEncoderInstruction(instruction)
+        let start = self.writerIndex
+        self.writeWithOutputRawSpan(minimumWritableBytes: bound) {
+            $0.appendQPACKEncoderInstruction(instruction, preferHuffmanEncoding: preferHuffmanEncoding)
+        }
+        #expect(self.writerIndex - start <= bound)
+    }
+
+    /// Appends `instruction` through an `OutputRawSpan`, and checks that it takes exactly as much room as
+    /// ``QPACKEncodedLength/decoderInstruction(_:)`` says.
+    @available(anyAppleOS 27, *)
+    mutating func writeQPACKDecoderInstruction(_ instruction: QPACKDecoderInstruction) {
+        let start = self.writerIndex
+        self.writeWithOutputRawSpan(minimumWritableBytes: QPACKEncodedLength.decoderInstruction(instruction)) {
+            $0.appendQPACKDecoderInstruction(instruction)
+        }
+        #expect(self.writerIndex - start == QPACKEncodedLength.decoderInstruction(instruction))
+    }
+}
