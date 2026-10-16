@@ -426,6 +426,33 @@ extension OutputRawSpan {
         self.appendQPACKPrefixedInteger(prefix.deltaBase, prefix: 7, prefixBits: signBit)
     }
 
+    /// Writes `prefix` into the `reservedLength` bytes at `start`, which were set aside for it, and moves the bytes
+    /// after them back over those the prefix doesn't need.
+    ///
+    /// - Precondition: `prefix` takes `reservedLength` bytes at most, and the reserved bytes are within the span.
+    @available(anyAppleOS 27, *)
+    mutating func insertFieldSectionPrefix(_ prefix: EncodedFieldSectionPrefix, at start: Int, reservedLength: Int) {
+        let length = QPACKEncodedLength.fieldSectionPrefix(prefix)
+        precondition(length <= reservedLength, "Not enough room reserved for the field section prefix")
+        precondition(start >= 0 && reservedLength <= self.byteCount &- start, "Reserved bytes out of bounds")
+
+        self.withUnsafeMutableBytes { buffer, initializedCount in
+            let unused = reservedLength &- length
+            if unused > 0 {
+                // The regions may overlap, which `copyMemory` allows.
+                let base = buffer.baseAddress!
+                let rest = start &+ reservedLength
+                (base + (start &+ length)).copyMemory(from: base + rest, byteCount: initializedCount &- rest)
+                initializedCount &-= unused
+            }
+
+            let prefixBuffer = UnsafeMutableRawBufferPointer(rebasing: buffer[start..<(start &+ length)])
+            var prefixOutput = OutputRawSpan(buffer: prefixBuffer, initializedCount: 0)
+            prefixOutput.appendFieldSectionPrefix(prefix)
+            _ = prefixOutput.finalize(for: prefixBuffer)
+        }
+    }
+
     /// Appends a string literal, encoded as in RFC 9204 § 4.1.2.
     @available(anyAppleOS 27, *)
     private mutating func appendQPACKEncodedString(
