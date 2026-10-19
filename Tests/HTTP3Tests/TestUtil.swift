@@ -13,9 +13,10 @@
 //===----------------------------------------------------------------------===//
 
 public import HTTP3
+import HTTPTypes
 import NIOCore
 
-@testable import QPACK
+@_spi(PackageInternal) @testable import QPACK
 
 extension String {
     @available(anyAppleOS 27, *)
@@ -39,5 +40,17 @@ extension HTTP3PushID: ExpressibleByIntegerLiteral {
 extension HTTP3GoawayID: ExpressibleByIntegerLiteral {
     public init(integerLiteral value: UInt64) {
         self.init(rawValue: value)
+    }
+}
+
+@available(anyAppleOS 27, *)
+extension StaticQPACKEncoder {
+    /// Test convenience: the field section the encoder writes for `headers`, read back from its bytes.
+    func encode(headers: [HTTPField]) -> FieldSection {
+        var buffer = ByteBuffer()
+        buffer.writeWithOutputRawSpan(minimumWritableBytes: self.maxEncodedLength(of: headers)) {
+            self.encode(headers: headers, into: &$0, preferHuffmanEncoding: false)
+        }
+        return try! buffer.readFieldSection()!
     }
 }

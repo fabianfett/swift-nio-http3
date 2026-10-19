@@ -44,14 +44,41 @@ struct FieldSectionEncodingTests {
     func staticEncoderWritesItsFieldSection(preferHuffmanEncoding: Bool) throws {
         let encoder = StaticQPACKEncoder()
         let bound = encoder.maxEncodedLength(of: Self.headers)
-        var buffer = ByteBuffer(initialCapacity: bound) { output in
+        let buffer = ByteBuffer(initialCapacity: bound) { output in
             encoder.encode(headers: Self.headers, into: &output, preferHuffmanEncoding: preferHuffmanEncoding)
         }
         #expect(buffer.readableBytes <= bound)
 
-        let decoded = try buffer.readFieldSection()
-        #expect(buffer.readableBytes == 0)
-        #expect(decoded == encoder.encode(headers: Self.headers))
+        let expected = FieldSection(
+            prefix: EncodedFieldSectionPrefix(encodedRequiredInsertCount: 0, deltaBase: 0, signBit: false),
+            lines: [
+                .indexed(.staticTable, index: 17),
+                .indexed(.staticTable, index: 23),
+                .literalWithNameReference(
+                    requireLiteralRepresentation: false,
+                    table: .staticTable,
+                    index: 0,
+                    value: "www.example.com"
+                ),
+                .literalWithNameReference(
+                    requireLiteralRepresentation: false,
+                    table: .staticTable,
+                    index: 1,
+                    value: "/" + String(repeating: "a", count: 300)
+                ),
+                .indexed(.staticTable, index: 29),
+                .literal(requireLiteralRepresentation: false, name: "x-custom-header", value: "some-custom-value"),
+                .literal(requireLiteralRepresentation: false, name: "x-unicode", value: "héllo wörld ✓ 🎉"),
+                .literal(requireLiteralRepresentation: false, name: "x-empty", value: ""),
+                .literalWithNameReference(
+                    requireLiteralRepresentation: true,
+                    table: .staticTable,
+                    index: 84,
+                    value: "Bearer secret"
+                ),
+            ]
+        )
+        #expect(FieldSection(readingAll: buffer) == expected)
     }
 
     @available(anyAppleOS 27, *)
@@ -64,32 +91,29 @@ struct FieldSectionEncodingTests {
         #expect(Array(buffer.readableBytesView) == [0, 0])
     }
 
-    /// Two encoders in the same state encode the same fields, one into a ``FieldSection`` and one into an
-    /// `OutputRawSpan`. Over enough sections the Base and the Required Insert Count outgrow a byte, and the prefix
-    /// usually takes less room than was reserved for it.
+    /// Field sections written by the dynamic encoder decode to the fields they were encoded from. Over enough sections
+    /// the Base outgrows the room the first byte of the Delta Base leaves it, and the prefix takes less room than was
+    /// reserved for it.
     @available(anyAppleOS 27, *)
     @Test(arguments: [true, false])
     func dynamicEncoderWritesItsFieldSection(preferHuffmanEncoding: Bool) throws {
-        func makeEncoder() -> DynamicQPACKEncoder {
-            DynamicQPACKEncoder.create(
-                dynamicTableMaxCapacity: 4096,
-                dynamicTableInitialCapacity: 4096,
-                maxBlockedStreams: 100,
-                targetEvictableFraction: 0.5
-            ).0
-        }
-        var reference = makeEncoder()
-        var encoder = makeEncoder()
+        var (encoder, setCapacity) = DynamicQPACKEncoder.create(
+            dynamicTableMaxCapacity: 4096,
+            dynamicTableInitialCapacity: 4096,
+            maxBlockedStreams: 100,
+            targetEvictableFraction: 0.5
+        )
+        var decoder = QPACKDecoder(dynamicTableMaxCapacity: 4096)
+        _ = try decoder.processInstruction(try #require(setCapacity))
 
         for round in 0..<200 {
             let streamID = QUICStreamID(rawValue: UInt64(round) * 4)
-            // A new field every round, so that every section inserts into the table.
-            let headers = Self.headers + [HTTPField(name: .init("x-round")!, value: "\(round)")]
-            let expected = reference.encode(headers: headers, forStream: streamID)
+            // A new field name every round, so that every section inserts into the table and evicts from it eventually.
+            let headers = Self.headers + [HTTPField(name: .init("x-round-\(round)")!, value: "\(round)")]
 
             var instructions = [QPACKEncoderInstruction]()
             let bound = encoder.maxEncodedLength(of: headers)
-            var buffer = ByteBuffer(initialCapacity: bound) { output in
+            let buffer = ByteBuffer(initialCapacity: bound) { output in
                 instructions = encoder.encode(
                     headers: headers,
                     forStream: streamID,
@@ -99,15 +123,26 @@ struct FieldSectionEncodingTests {
             }
             #expect(buffer.readableBytes <= bound, "round \(round)")
 
-            let decoded = try buffer.readFieldSection()
-            #expect(buffer.readableBytes == 0, "round \(round)")
-            #expect(decoded == expected.fieldSection, "round \(round)")
-            #expect(instructions == expected.instructions, "round \(round)")
+            for instruction in instructions {
+                _ = try decoder.processInstruction(instruction)
+            }
+            let fieldSection = FieldSection(readingAll: buffer)
+            let prefix = try #require(decoder.decodeFieldSectionPrefix(fieldSection.prefix), "round \(round)")
+            let decoded = try decoder.decodeFieldSection(
+                prefix: prefix,
+                lines: fieldSection.lines,
+                streamID: streamID
+            ).unwrap()
+            let (fields, acknowledgement) = try #require(decoded, "round \(round)")
+            // Only the canonical names and the values go over the wire.
+            #expect(
+                fields.map { [$0.name.canonicalName, $0.value] } == headers.map { [$0.name.canonicalName, $0.value] },
+                "round \(round)"
+            )
 
             // Acknowledge the section, so its entries can be evicted to make room for the next ones.
-            if expected.fieldSection.prefix.encodedRequiredInsertCount != 0 {
-                try reference.processInstruction(.sectionAcknowledgement(streamID: streamID))
-                try encoder.processInstruction(.sectionAcknowledgement(streamID: streamID))
+            if let acknowledgement {
+                try encoder.processInstruction(acknowledgement)
             }
         }
     }

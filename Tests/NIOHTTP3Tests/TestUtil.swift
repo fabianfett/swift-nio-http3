@@ -14,9 +14,11 @@
 
 import DequeModule
 public import HTTP3
+import HTTPTypes
 import NIOConcurrencyHelpers
 import NIOCore
 import NIOExtras
+@_spi(PackageInternal) import QPACK
 import Testing
 
 @available(anyAppleOS 27, *)
@@ -230,5 +232,17 @@ extension Trait where Self == ConditionTrait {
             return false
             #endif
         }
+    }
+}
+
+@available(anyAppleOS 27, *)
+extension StaticQPACKEncoder {
+    /// Test convenience: the field section the encoder writes for `headers`, read back from its bytes.
+    func encode(headers: [HTTPField]) -> FieldSection {
+        var buffer = ByteBuffer()
+        buffer.writeWithOutputRawSpan(minimumWritableBytes: self.maxEncodedLength(of: headers)) {
+            self.encode(headers: headers, into: &$0, preferHuffmanEncoding: false)
+        }
+        return try! buffer.readFieldSection()!
     }
 }

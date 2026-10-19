@@ -105,21 +105,6 @@ struct StreamTracker {
     }
 }
 
-@available(anyAppleOS 27, *)
-@_spi(PackageInternal)
-public struct QPACKEncodeResult: Sendable, Hashable {
-    @_spi(PackageInternal)
-    public let fieldSection: FieldSection
-    @_spi(PackageInternal)
-    public let instructions: [QPACKEncoderInstruction]
-
-    @_spi(PackageInternal)
-    public init(fieldSection: FieldSection, instructions: [QPACKEncoderInstruction]) {
-        self.fieldSection = fieldSection
-        self.instructions = instructions
-    }
-}
-
 /// A bit like ``FieldLine`` but without caring about wire representation.
 @available(anyAppleOS 27, *)
 private enum HeaderRepresentation {
@@ -246,18 +231,6 @@ public struct DynamicQPACKEncoder {
         return (encoder, result)
     }
 
-    @_spi(PackageInternal)
-    public mutating func encode(headers: [HTTPField], forStream streamID: QUICStreamID) -> QPACKEncodeResult {
-        var section = SectionState(base: self.table.insertCount, fieldCount: headers.count)
-        var lines = [FieldLine]()
-        lines.reserveCapacity(headers.count)
-        for header in headers {
-            lines.append(self.fieldLine(for: header, forStream: streamID, section: &section))
-        }
-        let prefix = self.finishSection(section, forStream: streamID)
-        return .init(fieldSection: .init(prefix: prefix, lines: lines), instructions: section.instructions)
-    }
-
     /// The largest number of bytes ``encode(headers:forStream:into:preferHuffmanEncoding:)`` appends for `headers`,
     /// if it is called next.
     @_spi(PackageInternal)
@@ -268,7 +241,7 @@ public struct DynamicQPACKEncoder {
             &+ QPACKEncodedLength.maxFieldLines(headers, indexLimit: max(StaticHeaderTable.raw.count, maxEntries))
     }
 
-    /// Encodes `headers` into a field section, and appends it to `output`. No intermediate ``FieldSection`` is built.
+    /// Encodes `headers` into a field section, and appends it to `output`.
     ///
     /// - Precondition: `output` has room for ``maxEncodedLength(of:)`` more bytes.
     /// - Returns: The instructions the peer's decoder needs to decode the field section. They must be sent on the
@@ -608,16 +581,6 @@ public struct StaticQPACKEncoder {
     @_spi(PackageInternal)
     public init() {}
 
-    @_spi(PackageInternal)
-    public func encode(headers: [HTTPField]) -> FieldSection {
-        var lines = [FieldLine]()
-        lines.reserveCapacity(headers.count)
-        for header in headers {
-            lines.append(self.fieldLine(for: header))
-        }
-        return .init(prefix: Self.prefix, lines: lines)
-    }
-
     /// The largest number of bytes ``encode(headers:into:preferHuffmanEncoding:)`` appends for `headers`.
     @_spi(PackageInternal)
     public func maxEncodedLength(of headers: [HTTPField]) -> Int {
@@ -625,7 +588,7 @@ public struct StaticQPACKEncoder {
             &+ QPACKEncodedLength.maxFieldLines(headers, indexLimit: StaticHeaderTable.raw.count)
     }
 
-    /// Encodes `headers` into a field section, and appends it to `output`. No intermediate ``FieldSection`` is built.
+    /// Encodes `headers` into a field section, and appends it to `output`.
     ///
     /// - Precondition: `output` has room for ``maxEncodedLength(of:)`` more bytes.
     @_spi(PackageInternal)
