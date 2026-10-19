@@ -82,10 +82,8 @@ extension BenchmarkCoder {
         streamID: QUICStreamID,
         into buffer: inout ByteBuffer
     ) {
-        let fieldSection = self.encodeHeaders(fields, streamID: streamID)
-        buffer.writeFieldSectionPrefix(fieldSection.prefix)
-        for line in fieldSection.lines {
-            buffer.writeFieldLine(line, preferHuffmanEncoding: true)
+        buffer.writeWithOutputRawSpan(minimumWritableBytes: self.maxEncodedLength(of: fields)) { output in
+            self.encodeHeaders(fields, streamID: streamID, into: &output, preferHuffmanEncoding: true)
         }
     }
 }
