@@ -280,22 +280,6 @@ extension ByteBuffer {
         }
     }
 
-    /// Write a single ``FieldLine`` to this buffer.
-    /// - Parameters:
-    ///   - fieldLine: The line to write.
-    ///   - preferHuffmanEncoding: Whether to use huffman coding for strings (where applicable and where it would be more efficient to do so).
-    /// - Returns: The number of bytes written.
-    @available(anyAppleOS 27, *)
-    @discardableResult
-    @_spi(PackageInternal)
-    public mutating func writeFieldLine(_ fieldLine: FieldLine, preferHuffmanEncoding: Bool) -> Int {
-        let start = self.writerIndex
-        self.writeWithOutputRawSpan(minimumWritableBytes: QPACKEncodedLength.maxFieldLine(fieldLine)) {
-            $0.appendFieldLine(fieldLine, preferHuffmanEncoding: preferHuffmanEncoding)
-        }
-        return self.writerIndex &- start
-    }
-
     /// Read a single ``FieldSectionPrefix`` from this `ByteBuffer`.
     /// - Returns: The section, or nil if it cannot be decoded.
     @available(anyAppleOS 27, *)
@@ -341,21 +325,6 @@ extension ByteBuffer {
         )
     }
 
-    /// Write a single ``FieldSectionPrefix`` to this buffer.
-    /// - Parameters
-    ///   - prefix: The ``FieldSectionPrefix`` to write.
-    /// - Returns: The number of bytes written.
-    @available(anyAppleOS 27, *)
-    @discardableResult
-    @_spi(PackageInternal)
-    public mutating func writeFieldSectionPrefix(_ prefix: EncodedFieldSectionPrefix) -> Int {
-        let start = self.writerIndex
-        self.writeWithOutputRawSpan(minimumWritableBytes: QPACKEncodedLength.fieldSectionPrefix(prefix)) {
-            $0.appendFieldSectionPrefix(prefix)
-        }
-        return self.writerIndex &- start
-    }
-
     @available(anyAppleOS 27, *)
     @_spi(PackageInternal)
     public mutating func readFieldSection() throws(IntegerReadingError) -> FieldSection? {
@@ -376,9 +345,10 @@ extension OutputRawSpan {
     /// - Parameters:
     ///   - fieldLine: The line to append.
     ///   - preferHuffmanEncoding: Whether to use huffman coding for strings (where applicable and where it would be more efficient to do so).
-    /// - Precondition: The span has room for ``QPACKEncodedLength/maxFieldLine(_:)`` more bytes.
+    /// - Precondition: The span has room for ``FieldLine/maxEncodedLength`` more bytes.
+    @_spi(PackageInternal)
     @available(anyAppleOS 27, *)
-    mutating func appendFieldLine(_ fieldLine: FieldLine, preferHuffmanEncoding: Bool) {
+    public mutating func appendFieldLine(_ fieldLine: FieldLine, preferHuffmanEncoding: Bool) {
         switch fieldLine {
         case .indexed(let table, let index):
             // First bit is 1. Then T. Then index
@@ -417,6 +387,20 @@ extension OutputRawSpan {
         }
     }
 
+    /// Appends a whole ``FieldSection``.
+    /// - Parameters:
+    ///   - fieldSection: The field section to append.
+    ///   - preferHuffmanEncoding: Whether to use huffman coding for strings (where applicable and where it would be more efficient to do so).
+    /// - Precondition: The span has room for ``FieldSection/maxEncodedLength`` more bytes.
+    @_spi(PackageInternal)
+    @available(anyAppleOS 27, *)
+    public mutating func appendFieldSection(_ fieldSection: FieldSection, preferHuffmanEncoding: Bool) {
+        self.appendFieldSectionPrefix(fieldSection.prefix)
+        for line in fieldSection.lines {
+            self.appendFieldLine(line, preferHuffmanEncoding: preferHuffmanEncoding)
+        }
+    }
+
     /// Appends a single ``EncodedFieldSectionPrefix``.
     /// - Precondition: The span has room for ``QPACKEncodedLength/fieldSectionPrefix(_:)`` more bytes.
     @available(anyAppleOS 27, *)
@@ -451,6 +435,29 @@ extension OutputRawSpan {
             prefixOutput.appendFieldSectionPrefix(prefix)
             _ = prefixOutput.finalize(for: prefixBuffer)
         }
+    }
+}
+
+@available(anyAppleOS 27, *)
+extension FieldLine {
+    /// The largest number of bytes ``OutputRawSpan/appendFieldLine(_:preferHuffmanEncoding:)`` appends for this line.
+    @_spi(PackageInternal)
+    public var maxEncodedLength: Int {
+        QPACKEncodedLength.maxFieldLine(self)
+    }
+}
+
+@available(anyAppleOS 27, *)
+extension FieldSection {
+    /// The largest number of bytes ``OutputRawSpan/appendFieldSection(_:preferHuffmanEncoding:)`` appends for this
+    /// section.
+    @_spi(PackageInternal)
+    public var maxEncodedLength: Int {
+        var length = QPACKEncodedLength.fieldSectionPrefix(self.prefix)
+        for line in self.lines {
+            length &+= QPACKEncodedLength.maxFieldLine(line)
+        }
+        return length
     }
 }
 

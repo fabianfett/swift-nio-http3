@@ -604,14 +604,13 @@ struct HTTP3FrameCodingTests {
         // That's an error.
         buffer.writeEncodedInteger(HTTP3FrameType.headers.rawValue, strategy: .quic)
         buffer.writeLengthPrefixed(strategy: .quic) { tempBuffer in
-            var bytesWritten = 0
-            bytesWritten += tempBuffer.writeFieldSectionPrefix(testFieldSection.prefix)
-            for line in testFieldSection.lines {
-                bytesWritten += tempBuffer.writeFieldLine(line, preferHuffmanEncoding: preferHuffmanEncoding)
+            let start = tempBuffer.writerIndex
+            tempBuffer.writeWithOutputRawSpan(minimumWritableBytes: testFieldSection.maxEncodedLength) {
+                $0.appendFieldSection(testFieldSection, preferHuffmanEncoding: preferHuffmanEncoding)
             }
             // write 1 extra byte
-            bytesWritten += tempBuffer.writeBytes([0])
-            return bytesWritten
+            tempBuffer.writeBytes([0])
+            return tempBuffer.writerIndex - start
         }
 
         var decoder = HTTP3FrameDecoder()

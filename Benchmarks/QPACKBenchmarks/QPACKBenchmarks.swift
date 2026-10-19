@@ -71,7 +71,9 @@ let benchmarks: @Sendable () -> Void = {
         for _ in benchmark.scaledIterations {
             result.clear()
             for line in fieldLines {
-                result.writeFieldLine(line, preferHuffmanEncoding: true)
+                result.writeWithOutputRawSpan(minimumWritableBytes: line.maxEncodedLength) {
+                    $0.appendFieldLine(line, preferHuffmanEncoding: true)
+                }
             }
             blackHole(result)
         }

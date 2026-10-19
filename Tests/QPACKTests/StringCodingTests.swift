@@ -289,7 +289,7 @@ struct StringCodingTests {
         // The readQPACKEncodedString function reads the length as an int. UInt.max > Int.max so this should throw.
         let length: UInt = .max
         var buffer = ByteBuffer()
-        buffer.writeQPACKPrefixedInteger(length, prefix: 8)
+        buffer.writeWithOutputRawSpan(minimumWritableBytes: 11) { $0.appendQPACKPrefixedInteger(length, prefix: 8) }
         buffer.writeBytes([1, 2, 3, 4])
 
         #expect(throws: IntegerReadingError.unrepresentable) {

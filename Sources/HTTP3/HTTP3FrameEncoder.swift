@@ -106,11 +106,10 @@ extension ByteBuffer {
     /// - Returns: The number of bytes written
     @available(anyAppleOS 27, *)
     fileprivate mutating func writeFieldSection(_ fieldSection: FieldSection, preferHuffmanEncoding: Bool) -> Int {
-        var bytesWritten = 0
-        bytesWritten += self.writeFieldSectionPrefix(fieldSection.prefix)
-        for line in fieldSection.lines {
-            bytesWritten += self.writeFieldLine(line, preferHuffmanEncoding: preferHuffmanEncoding)
+        let start = self.writerIndex
+        self.writeWithOutputRawSpan(minimumWritableBytes: fieldSection.maxEncodedLength) {
+            $0.appendFieldSection(fieldSection, preferHuffmanEncoding: preferHuffmanEncoding)
         }
-        return bytesWritten
+        return self.writerIndex &- start
     }
 }

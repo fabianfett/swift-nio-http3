@@ -34,9 +34,8 @@ struct HTTP3FrameDecoderStateMachineTests {
     private var testHeaderFrameBytes: [UInt8] {
         let header = self.testHeader
         var buffer = ByteBuffer()
-        buffer.writeFieldSectionPrefix(header.fieldSection.prefix)
-        for line in header.fieldSection.lines {
-            buffer.writeFieldLine(line, preferHuffmanEncoding: false)
+        buffer.writeWithOutputRawSpan(minimumWritableBytes: header.fieldSection.maxEncodedLength) {
+            $0.appendFieldSection(header.fieldSection, preferHuffmanEncoding: false)
         }
         let fieldSectionBytes = [UInt8](buffer: buffer)
         let prefix: [UInt8] = [1, UInt8(fieldSectionBytes.count)]  // prefix with frame type and length

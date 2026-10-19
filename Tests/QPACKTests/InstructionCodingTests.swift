@@ -41,7 +41,9 @@ struct InstructionCodingTests {
         var buffer = ByteBuffer()
         /// 0x20 followed by UInt.max means set the dynamic table size to UInt.max.
         /// This is always an error on any platform, because UInt.max is always more than Int.max and therefore we don't allow it.
-        buffer.writeQPACKPrefixedInteger(UInt.max, prefix: 5, prefixBits: 0x20)
+        buffer.writeWithOutputRawSpan(minimumWritableBytes: 11) {
+            $0.appendQPACKPrefixedInteger(UInt.max, prefix: 5, prefixBits: 0x20)
+        }
 
         #expect(throws: IntegerReadingError.unrepresentable) {
             try buffer.readQPACKEncoderInstruction()
