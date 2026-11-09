@@ -15,40 +15,68 @@
 public import HTTPTypes
 @_spi(PackageInternal) import QPACK
 
-public import struct NIOCore.ByteBuffer
-
-/// Encodes HTTP messages straight into HTTP/3 frames.
+/// Encodes the HEADERS frames of HTTP messages into an `OutputRawSpan`.
 ///
 /// Unlike going through ``HTTP3Frame`` and ``QPACKCoder``, the field lines are written as they are encoded: no
-/// intermediate `[HTTPField]` or list of field lines is built.
+/// intermediate `[HTTPField]` or list of field lines is built. The field sections only use the static table.
+///
+/// Work out the room a frame needs with `maxFieldSectionLength(of:)` and
+/// ``HTTP3EncodedLength/headersFrame(maxPayloadLength:)``, then pass the same `maxFieldSectionLength` to
+/// `appendHeadersFrame`, so the fields are only measured once.
 @_spi(PackageInternal)
 @available(anyAppleOS 27, *)
 public enum HTTP3MessageEncoding {
-    /// Writes a HEADERS frame carrying `request`.
+    /// The largest number of bytes the field section of `request` takes.
     @_spi(PackageInternal)
-    public static func writeHeadersFrame(
+    public static func maxFieldSectionLength(of request: HTTPRequest) -> Int {
+        let encoder = StaticQPACKEncoder()
+        let pseudo = request.pseudoHeaderFields
+        var length = encoder.fieldSectionPrefixLength &+ encoder.maxEncodedLength(of: pseudo.method)
+        if let scheme = pseudo.scheme {
+            length &+= encoder.maxEncodedLength(of: scheme)
+        }
+        if let authority = pseudo.authority {
+            length &+= encoder.maxEncodedLength(of: authority)
+        }
+        if let path = pseudo.path {
+            length &+= encoder.maxEncodedLength(of: path)
+        }
+        if let extendedConnectProtocol = pseudo.extendedConnectProtocol {
+            length &+= encoder.maxEncodedLength(of: extendedConnectProtocol)
+        }
+        return length &+ Self.maxEncodedLength(of: request.headerFields, encoder: encoder)
+    }
+
+    /// The largest number of bytes the field section of `response` takes.
+    @_spi(PackageInternal)
+    public static func maxFieldSectionLength(of response: HTTPResponse) -> Int {
+        let encoder = StaticQPACKEncoder()
+        return encoder.fieldSectionPrefixLength
+            &+ encoder.maxEncodedLength(of: response.pseudoHeaderFields.status)
+            &+ Self.maxEncodedLength(of: response.headerFields, encoder: encoder)
+    }
+
+    /// The largest number of bytes the field section of `trailers` takes.
+    @_spi(PackageInternal)
+    public static func maxFieldSectionLength(of trailers: HTTPFields) -> Int {
+        let encoder = StaticQPACKEncoder()
+        return encoder.fieldSectionPrefixLength &+ Self.maxEncodedLength(of: trailers, encoder: encoder)
+    }
+
+    /// Appends a HEADERS frame carrying `request`.
+    ///
+    /// - Precondition: `maxFieldSectionLength` is ``maxFieldSectionLength(of:)-(HTTPRequest)`` for `request`, and
+    ///   `output` has room for ``HTTP3EncodedLength/headersFrame(maxPayloadLength:)`` of it.
+    @_spi(PackageInternal)
+    public static func appendHeadersFrame(
         request: HTTPRequest,
-        into buffer: inout ByteBuffer,
+        maxFieldSectionLength: Int,
+        into output: inout OutputRawSpan,
         preferHuffmanEncoding: Bool
     ) {
         let encoder = StaticQPACKEncoder()
         let pseudo = request.pseudoHeaderFields
-        var maxPayloadLength = encoder.fieldSectionPrefixLength &+ encoder.maxEncodedLength(of: pseudo.method)
-        if let scheme = pseudo.scheme {
-            maxPayloadLength &+= encoder.maxEncodedLength(of: scheme)
-        }
-        if let authority = pseudo.authority {
-            maxPayloadLength &+= encoder.maxEncodedLength(of: authority)
-        }
-        if let path = pseudo.path {
-            maxPayloadLength &+= encoder.maxEncodedLength(of: path)
-        }
-        if let extendedConnectProtocol = pseudo.extendedConnectProtocol {
-            maxPayloadLength &+= encoder.maxEncodedLength(of: extendedConnectProtocol)
-        }
-        maxPayloadLength &+= Self.maxEncodedLength(of: request.headerFields, encoder: encoder)
-
-        Self.writeHeadersFrame(maxPayloadLength: maxPayloadLength, into: &buffer) { output in
+        output.appendHTTP3HeadersFrame(maxPayloadLength: maxFieldSectionLength) { output in
             encoder.appendFieldSectionPrefix(into: &output)
             encoder.append(pseudo.method, into: &output, preferHuffmanEncoding: preferHuffmanEncoding)
             if let scheme = pseudo.scheme {
@@ -72,23 +100,25 @@ public enum HTTP3MessageEncoding {
         }
     }
 
-    /// Writes a HEADERS frame carrying `response`.
+    /// Appends a HEADERS frame carrying `response`.
+    ///
+    /// - Precondition: `maxFieldSectionLength` is ``maxFieldSectionLength(of:)-(HTTPResponse)`` for `response`,
+    ///   and `output` has room for ``HTTP3EncodedLength/headersFrame(maxPayloadLength:)`` of it.
     @_spi(PackageInternal)
-    public static func writeHeadersFrame(
+    public static func appendHeadersFrame(
         response: HTTPResponse,
-        into buffer: inout ByteBuffer,
+        maxFieldSectionLength: Int,
+        into output: inout OutputRawSpan,
         preferHuffmanEncoding: Bool
     ) {
         let encoder = StaticQPACKEncoder()
-        let status = response.pseudoHeaderFields.status
-        let maxPayloadLength =
-            encoder.fieldSectionPrefixLength
-            &+ encoder.maxEncodedLength(of: status)
-            &+ Self.maxEncodedLength(of: response.headerFields, encoder: encoder)
-
-        Self.writeHeadersFrame(maxPayloadLength: maxPayloadLength, into: &buffer) { output in
+        output.appendHTTP3HeadersFrame(maxPayloadLength: maxFieldSectionLength) { output in
             encoder.appendFieldSectionPrefix(into: &output)
-            encoder.append(status, into: &output, preferHuffmanEncoding: preferHuffmanEncoding)
+            encoder.append(
+                response.pseudoHeaderFields.status,
+                into: &output,
+                preferHuffmanEncoding: preferHuffmanEncoding
+            )
             Self.append(
                 response.headerFields,
                 into: &output,
@@ -98,80 +128,21 @@ public enum HTTP3MessageEncoding {
         }
     }
 
-    /// Writes a HEADERS frame carrying `trailers`.
+    /// Appends a HEADERS frame carrying `trailers`.
+    ///
+    /// - Precondition: `maxFieldSectionLength` is ``maxFieldSectionLength(of:)-(HTTPFields)`` for `trailers`, and
+    ///   `output` has room for ``HTTP3EncodedLength/headersFrame(maxPayloadLength:)`` of it.
     @_spi(PackageInternal)
-    public static func writeHeadersFrame(
+    public static func appendHeadersFrame(
         trailers: HTTPFields,
-        into buffer: inout ByteBuffer,
+        maxFieldSectionLength: Int,
+        into output: inout OutputRawSpan,
         preferHuffmanEncoding: Bool
     ) {
         let encoder = StaticQPACKEncoder()
-        let maxPayloadLength =
-            encoder.fieldSectionPrefixLength &+ Self.maxEncodedLength(of: trailers, encoder: encoder)
-
-        Self.writeHeadersFrame(maxPayloadLength: maxPayloadLength, into: &buffer) { output in
+        output.appendHTTP3HeadersFrame(maxPayloadLength: maxFieldSectionLength) { output in
             encoder.appendFieldSectionPrefix(into: &output)
             Self.append(trailers, into: &output, encoder: encoder, preferHuffmanEncoding: preferHuffmanEncoding)
-        }
-    }
-
-    /// The number of bytes ``writeDataFrameHeader(payloadLength:into:)`` writes.
-    @_spi(PackageInternal)
-    public static func dataFrameHeaderLength(payloadLength: Int) -> Int {
-        HTTP3EncodedLength.dataFrameHeader(payloadLength: payloadLength)
-    }
-
-    /// Writes the type and length of a DATA frame; the `payloadLength` bytes of payload must follow.
-    @_spi(PackageInternal)
-    public static func writeDataFrameHeader(payloadLength: Int, into buffer: inout ByteBuffer) {
-        buffer.writeWithOutputRawSpan(
-            minimumWritableBytes: HTTP3EncodedLength.dataFrameHeader(payloadLength: payloadLength)
-        ) {
-            $0.appendHTTP3DataFrameHeader(payloadLength: payloadLength)
-        }
-    }
-
-    /// Writes a frame which carries no field section, such as SETTINGS or GOAWAY.
-    ///
-    /// - Precondition: `frame` is not HEADERS or PUSH\_PROMISE, those need ``writeHeadersFrame(request:into:preferHuffmanEncoding:)``
-    ///   and friends.
-    @_spi(PackageInternal)
-    public static func writeFrame(_ frame: HTTP3Frame, into buffer: inout ByteBuffer) {
-        switch frame {
-        case .data(let data):
-            Self.writeDataFrameHeader(payloadLength: data.payload.readableBytes, into: &buffer)
-            buffer.writeImmutableBuffer(data.payload)
-        case .settings(let settings):
-            buffer.writeWithOutputRawSpan(minimumWritableBytes: HTTP3EncodedLength.settingsFrame(settings.settings)) {
-                $0.appendHTTP3SettingsFrame(settings.settings)
-            }
-        case .goaway(let goaway):
-            buffer.writeWithOutputRawSpan(minimumWritableBytes: HTTP3EncodedLength.goawayFrame(goaway.id)) {
-                $0.appendHTTP3GoawayFrame(goaway.id)
-            }
-        case .maxPushID(let maxPushID):
-            buffer.writeWithOutputRawSpan(minimumWritableBytes: HTTP3EncodedLength.maxPushIDFrame(maxPushID.id)) {
-                $0.appendHTTP3MaxPushIDFrame(maxPushID.id)
-            }
-        case .cancelPush(let cancelPush):
-            buffer.writeWithOutputRawSpan(minimumWritableBytes: HTTP3EncodedLength.cancelPushFrame(cancelPush.pushID)) {
-                $0.appendHTTP3CancelPushFrame(cancelPush.pushID)
-            }
-        case .headers, .pushPromise:
-            preconditionFailure("\(frame.type) frames carry a field section and must be QPACK encoded")
-        }
-    }
-
-    /// Writes a HEADERS frame whose payload, at most `maxPayloadLength` bytes, `encodePayload` appends.
-    private static func writeHeadersFrame(
-        maxPayloadLength: Int,
-        into buffer: inout ByteBuffer,
-        encodePayload: (inout OutputRawSpan) -> Void
-    ) {
-        buffer.writeWithOutputRawSpan(
-            minimumWritableBytes: HTTP3EncodedLength.headersFrame(maxPayloadLength: maxPayloadLength)
-        ) {
-            $0.appendHTTP3HeadersFrame(maxPayloadLength: maxPayloadLength, encodePayload: encodePayload)
         }
     }
 

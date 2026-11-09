@@ -196,8 +196,11 @@ extension HTTP3StreamState {
         to stream: inout QUICStream<Consumer>
     ) throws(HTTP3Error) {
         try self.core.willWriteHead(informational: response.status.kind == .informational)
-        self.core.context.encodeHead(response)
-        self._commit(to: &stream)
+        let context = self.core.context
+        let length = context.messageLength(response, body: nil, trailers: nil)
+        self._append(to: &stream, maxLength: length.maxLength) { output in
+            context.appendMessage(response, body: nil, trailers: nil, length: length, into: &output)
+        }
     }
 
     /// Writes the request head. It's sent when the visit ends, like everything written.
@@ -209,8 +212,11 @@ extension HTTP3StreamState {
         to stream: inout QUICStream<Consumer>
     ) throws(HTTP3Error) {
         try self.core.willWriteHead(informational: false)
-        self.core.context.encodeHead(request)
-        self._commit(to: &stream)
+        let context = self.core.context
+        let length = context.messageLength(request, body: nil, trailers: nil)
+        self._append(to: &stream, maxLength: length.maxLength) { output in
+            context.appendMessage(request, body: nil, trailers: nil, length: length, into: &output)
+        }
     }
 
     /// Writes part of the body. It's sent when the visit ends, like everything written.
@@ -228,18 +234,18 @@ extension HTTP3StreamState {
         let length = body.readableBytes
         guard length > 0 else { return }
 
-        let context = self.core.context
-        if length <= context.configuration.maximumCopiedBodyLength {
-            context.encodeDataFrame(copying: body)
-            Self._commitScratch(context, to: &stream)
-            self.core.writer.writtenInVisit &+= HTTP3ConnectionContext.dataFrameHeaderLength(payloadLength: length)
+        if length <= self.core.context.configuration.maximumCopiedBodyLength {
+            self._append(to: &stream, maxLength: HTTP3ConnectionContext.dataFrameLength(copying: body)) { output in
+                HTTP3ConnectionContext.appendDataFrame(copying: body, into: &output)
+            }
         } else {
-            context.encodeDataFrameHeader(payloadLength: length)
-            Self._commitScratch(context, to: &stream)
+            self._append(to: &stream, maxLength: HTTP3ConnectionContext.dataFrameHeaderLength(payloadLength: length)) {
+                output in
+                HTTP3ConnectionContext.appendDataFrameHeader(payloadLength: length, into: &output)
+            }
             stream.write(body)
+            self.core.writer.writtenInVisit &+= length
         }
-        self.core.writer.flushPending = true
-        self.core.writer.writtenInVisit &+= length
     }
 
     /// Ends the message, with trailers if there are any. It's sent, with a FIN, when the visit ends.
@@ -253,8 +259,11 @@ extension HTTP3StreamState {
     ) throws {
         if let trailers {
             try self.core.willWriteTrailers()
-            self.core.context.encodeTrailers(trailers)
-            self._commit(to: &stream)
+            let context = self.core.context
+            let length = context.trailersLength(trailers)
+            self._append(to: &stream, maxLength: length.maxLength) { output in
+                context.appendTrailers(trailers, length: length, into: &output)
+            }
         } else {
             try self.core.willEnd()
         }
@@ -278,8 +287,11 @@ extension HTTP3StreamState {
         } else {
             try self.core.willEnd()
         }
-        self.core.context.encodeResponse(response, body: body, trailers: trailers)
-        self._commit(to: &stream)
+        let context = self.core.context
+        let length = context.messageLength(response, body: body, trailers: trailers)
+        self._append(to: &stream, maxLength: length.maxLength) { output in
+            context.appendMessage(response, body: body, trailers: trailers, length: length, into: &output)
+        }
         try self._flush(&stream, fin: true)
     }
 
@@ -300,8 +312,11 @@ extension HTTP3StreamState {
         } else {
             try self.core.willEnd()
         }
-        self.core.context.encodeRequest(request, body: body, trailers: trailers)
-        self._commit(to: &stream)
+        let context = self.core.context
+        let length = context.messageLength(request, body: body, trailers: trailers)
+        self._append(to: &stream, maxLength: length.maxLength) { output in
+            context.appendMessage(request, body: body, trailers: trailers, length: length, into: &output)
+        }
         try self._flush(&stream, fin: true)
     }
 
@@ -387,24 +402,35 @@ extension HTTP3StreamState {
         }
     }
 
-    /// Queues what's been encoded into the connection's scratch buffer as one QUIC frame.
+    /// Queues the frames `append` appends, at most `maxLength` bytes, to be sent when the visit ends.
     @inlinable
-    mutating func _commit<Consumer: QUICStreamConsumer & ~Copyable>(to stream: inout QUICStream<Consumer>) {
-        let context = self.core.context
-        self.core.writer.flushPending = true
-        self.core.writer.writtenInVisit &+= context.scratch.readableBytes
-        Self._commitScratch(context, to: &stream)
-    }
-
-    /// Queues what's been encoded into the connection's scratch buffer as one QUIC frame.
-    @inlinable
-    static func _commitScratch<Consumer: QUICStreamConsumer & ~Copyable>(
-        _ context: HTTP3ConnectionContext,
-        to stream: inout QUICStream<Consumer>
+    mutating func _append<Consumer: QUICStreamConsumer & ~Copyable>(
+        to stream: inout QUICStream<Consumer>,
+        maxLength: Int,
+        _ append: (inout OutputRawSpan) -> Void
     ) {
-        let count = context.scratch.readableBytes
-        stream.withWritableSpan(count: count) { span in
-            context.copyScratch(into: &span)
+        self.core.writer.flushPending = true
+        self.core.writer.writtenInVisit &+= stream._append(maxLength: maxLength, append)
+    }
+}
+
+@available(anyAppleOS 27, *)
+extension QUICStream where Consumer: ~Copyable {
+    /// Queues what `append` appends, at most `maxLength` bytes, as one QUIC frame, and returns its length.
+    ///
+    /// The frames are encoded in place, in the stream's send buffer.
+    @inlinable
+    @discardableResult
+    mutating func _append(maxLength: Int, _ append: (inout OutputRawSpan) -> Void) -> Int {
+        var written = 0
+        self.withWritableSpan(count: maxLength) { span in
+            span.withUnsafeMutableBytes { buffer in
+                var output = OutputRawSpan(buffer: buffer, initializedCount: 0)
+                append(&output)
+                written = output.finalize(for: buffer)
+            }
+            return written
         }
+        return written
     }
 }

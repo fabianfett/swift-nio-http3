@@ -30,12 +30,7 @@ struct HTTP3MessageEncodingTests {
         authorization.indexingStrategy = .disallow
         request.headerFields.append(authorization)
 
-        var buffer = ByteBuffer()
-        HTTP3MessageEncoding.writeHeadersFrame(
-            request: request,
-            into: &buffer,
-            preferHuffmanEncoding: preferHuffmanEncoding
-        )
+        var buffer = Self.headersFrame(request: request, preferHuffmanEncoding: preferHuffmanEncoding)
 
         let fields = try Self.decodeHeadersFrame(&buffer)
         #expect(try HTTP3MessageDecoding.request(fields: fields, extendedConnectSupported: false) == request)
@@ -46,8 +41,7 @@ struct HTTP3MessageEncodingTests {
         var request = HTTPRequest(method: .connect, scheme: "https", authority: "example.com", path: "/chat")
         request.extendedConnectProtocol = "websocket"
 
-        var buffer = ByteBuffer()
-        HTTP3MessageEncoding.writeHeadersFrame(request: request, into: &buffer, preferHuffmanEncoding: true)
+        var buffer = Self.headersFrame(request: request, preferHuffmanEncoding: true)
 
         let fields = try Self.decodeHeadersFrame(&buffer)
         #expect(try HTTP3MessageDecoding.request(fields: fields, extendedConnectSupported: true) == request)
@@ -59,8 +53,7 @@ struct HTTP3MessageEncodingTests {
         response.headerFields[.contentLength] = "42"
         response.headerFields[.server] = "swift-nio-http3"
 
-        var buffer = ByteBuffer()
-        HTTP3MessageEncoding.writeHeadersFrame(response: response, into: &buffer, preferHuffmanEncoding: true)
+        var buffer = Self.headersFrame(response: response, preferHuffmanEncoding: true)
 
         let fields = try Self.decodeHeadersFrame(&buffer)
         #expect(try HTTP3MessageDecoding.response(fields: fields) == response)
@@ -70,8 +63,7 @@ struct HTTP3MessageEncodingTests {
     @Test func trailersRoundTrip() throws {
         let trailers: HTTPFields = [HTTPField.Name("x-checksum")!: "1234"]
 
-        var buffer = ByteBuffer()
-        HTTP3MessageEncoding.writeHeadersFrame(trailers: trailers, into: &buffer, preferHuffmanEncoding: false)
+        var buffer = Self.headersFrame(trailers: trailers, preferHuffmanEncoding: false)
 
         let fields = try Self.decodeHeadersFrame(&buffer)
         #expect(try HTTP3MessageDecoding.trailers(fields: fields) == trailers)
@@ -79,32 +71,14 @@ struct HTTP3MessageEncodingTests {
 
     @available(anyAppleOS 27, *)
     @Test func longFieldSectionRoundTrips() throws {
-        // Longer than the two byte length the frame is written with up front.
+        // Long enough for the frame's length to take four bytes.
         var response = HTTPResponse(status: .ok)
         response.headerFields[HTTPField.Name("x-long")!] = String(repeating: "a", count: 20_000)
 
-        var buffer = ByteBuffer()
-        HTTP3MessageEncoding.writeHeadersFrame(response: response, into: &buffer, preferHuffmanEncoding: false)
+        var buffer = Self.headersFrame(response: response, preferHuffmanEncoding: false)
 
         let fields = try Self.decodeHeadersFrame(&buffer)
         #expect(try HTTP3MessageDecoding.response(fields: fields) == response)
-    }
-
-    @available(anyAppleOS 27, *)
-    @Test(arguments: [0, 1, 63, 64, 16_383, 16_384])
-    func dataFrameHeaderLengthMatchesWhatIsWritten(payloadLength: Int) throws {
-        var buffer = ByteBuffer()
-        HTTP3MessageEncoding.writeDataFrameHeader(payloadLength: payloadLength, into: &buffer)
-        #expect(buffer.readableBytes == HTTP3MessageEncoding.dataFrameHeaderLength(payloadLength: payloadLength))
-
-        buffer.writeRepeatingByte(0, count: payloadLength)
-        var decoder = HTTP3FrameDecoder()
-        let frame = try decoder.decode(buffer: &buffer)
-        guard case .known(.data(let data)) = frame else {
-            Issue.record("Expected a DATA frame, got \(String(describing: frame))")
-            return
-        }
-        #expect(data.payload.readableBytes == payloadLength)
     }
 
     @available(anyAppleOS 27, *)
@@ -168,6 +142,51 @@ struct HTTP3MessageEncodingTests {
     private static func fieldSectionPayload(lines: [UInt8]) -> ByteBuffer {
         // Required Insert Count 0, then Base 0
         ByteBuffer(bytes: [0, 0] + lines)
+    }
+
+    /// The HEADERS frame of `request`, written into exactly the room the encoder asks for.
+    @available(anyAppleOS 27, *)
+    private static func headersFrame(request: HTTPRequest, preferHuffmanEncoding: Bool) -> ByteBuffer {
+        let maxFieldSectionLength = HTTP3MessageEncoding.maxFieldSectionLength(of: request)
+        let bytes = encodeWithExactRoom(HTTP3EncodedLength.headersFrame(maxPayloadLength: maxFieldSectionLength)) {
+            HTTP3MessageEncoding.appendHeadersFrame(
+                request: request,
+                maxFieldSectionLength: maxFieldSectionLength,
+                into: &$0,
+                preferHuffmanEncoding: preferHuffmanEncoding
+            )
+        }
+        return ByteBuffer(bytes: bytes)
+    }
+
+    /// The HEADERS frame of `response`, written into exactly the room the encoder asks for.
+    @available(anyAppleOS 27, *)
+    private static func headersFrame(response: HTTPResponse, preferHuffmanEncoding: Bool) -> ByteBuffer {
+        let maxFieldSectionLength = HTTP3MessageEncoding.maxFieldSectionLength(of: response)
+        let bytes = encodeWithExactRoom(HTTP3EncodedLength.headersFrame(maxPayloadLength: maxFieldSectionLength)) {
+            HTTP3MessageEncoding.appendHeadersFrame(
+                response: response,
+                maxFieldSectionLength: maxFieldSectionLength,
+                into: &$0,
+                preferHuffmanEncoding: preferHuffmanEncoding
+            )
+        }
+        return ByteBuffer(bytes: bytes)
+    }
+
+    /// The HEADERS frame of `trailers`, written into exactly the room the encoder asks for.
+    @available(anyAppleOS 27, *)
+    private static func headersFrame(trailers: HTTPFields, preferHuffmanEncoding: Bool) -> ByteBuffer {
+        let maxFieldSectionLength = HTTP3MessageEncoding.maxFieldSectionLength(of: trailers)
+        let bytes = encodeWithExactRoom(HTTP3EncodedLength.headersFrame(maxPayloadLength: maxFieldSectionLength)) {
+            HTTP3MessageEncoding.appendHeadersFrame(
+                trailers: trailers,
+                maxFieldSectionLength: maxFieldSectionLength,
+                into: &$0,
+                preferHuffmanEncoding: preferHuffmanEncoding
+            )
+        }
+        return ByteBuffer(bytes: bytes)
     }
 
     /// Decodes a HEADERS frame the way the channel based stack does: through ``HTTP3FrameDecoder``.

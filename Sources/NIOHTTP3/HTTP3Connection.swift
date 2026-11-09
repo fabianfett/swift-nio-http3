@@ -267,7 +267,9 @@ extension HTTP3Connection {
         _ = quic.assumeIsolated().withStreams { streams in
             if let control = action.controlStream {
                 _ = streams.withStream(handle: control) { stream, _ in
-                    HTTP3StreamState<Consumer.RequestState>._commitScratch(context, to: &stream)
+                    stream._append(maxLength: HTTP3ConnectionContext.goawayFrameLength(action.goawayID)) { output in
+                        HTTP3ConnectionContext.appendGoawayFrame(action.goawayID, into: &output)
+                    }
                     try? stream.flush()
                 }
             }
@@ -358,8 +360,9 @@ final class HTTP3ConnectionEventsHandler<Consumer: HTTP3Consumer>: ChannelInboun
                 )
                 context.outboundControlStreamCreated(handle: handle)
                 _ = streams.withStream(handle: handle) { stream, _ in
-                    context.encodeControlStreamPreamble()
-                    HTTP3StreamState<Consumer.RequestState>._commitScratch(context, to: &stream)
+                    stream._append(maxLength: context.controlStreamPreambleLength) { output in
+                        context.appendControlStreamPreamble(into: &output)
+                    }
                     if stream.id != nil {
                         try? stream.flush()
                     }

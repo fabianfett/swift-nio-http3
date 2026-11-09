@@ -52,11 +52,6 @@ final class HTTP3ConnectionContext {
     /// break the cycle.
     private var channel: (any Channel)?
 
-    /// Where outbound frames are encoded before they are copied into a stream. Reused, so encoding doesn't
-    /// allocate.
-    @usableFromInline
-    var scratch: ByteBuffer
-
     /// The SETTINGS the peer sent, once it has.
     private(set) var peerSettings: HTTP3Settings?
 
@@ -107,8 +102,6 @@ final class HTTP3ConnectionContext {
         self.stateMachine = HTTP3ConnectionStateMachine(settings: settings, type: isServer ? .server : .client)
         self.logger = logger
         self.channel = channel
-        self.scratch = ByteBuffer()
-        self.scratch.reserveCapacity(1024)
         self.peerSettings = nil
         self.outboundControlStream = nil
         self.inboundControl = nil
@@ -257,99 +250,170 @@ final class HTTP3ConnectionContext {
 
     // MARK: Encoding
 
-    /// Copies what's been encoded into ``scratch`` into `span`, returning the number of bytes copied.
+    // Frames are appended straight into the stream's send buffer: the `…Length` methods say how much room they
+    // need, and the `append…` methods append them. The fields of a message are measured once, into a
+    // ``MessageLength``, and appended with it.
+
+    /// The room the frames of a message need, worked out before they are appended.
     @usableFromInline
-    func copyScratch(into span: inout MutableRawSpan) -> Int {
-        let count = self.scratch.readableBytes
-        self.scratch.withUnsafeReadableBytes { source in
-            span.withUnsafeMutableBytes { destination in
-                destination.copyMemory(from: source)
+    struct MessageLength {
+        /// The largest field section of the head, if the message has one.
+        var maxHeadFieldSection: Int?
+        /// The largest field section of the trailers, if the message has any.
+        var maxTrailersFieldSection: Int?
+        /// The largest number of bytes the message's frames take.
+        @usableFromInline
+        var maxLength: Int
+    }
+
+    /// The room the frames of `head`, a copy of `body` if it isn't empty, and `trailers` need.
+    @usableFromInline
+    func messageLength(_ head: HTTPRequest, body: ByteBuffer?, trailers: HTTPFields?) -> MessageLength {
+        self.messageLength(
+            maxHeadFieldSection: HTTP3MessageEncoding.maxFieldSectionLength(of: head),
+            body: body,
+            trailers: trailers
+        )
+    }
+
+    /// The room the frames of `head`, a copy of `body` if it isn't empty, and `trailers` need.
+    @usableFromInline
+    func messageLength(_ head: HTTPResponse, body: ByteBuffer?, trailers: HTTPFields?) -> MessageLength {
+        self.messageLength(
+            maxHeadFieldSection: HTTP3MessageEncoding.maxFieldSectionLength(of: head),
+            body: body,
+            trailers: trailers
+        )
+    }
+
+    /// The room the HEADERS frame of `trailers` needs.
+    @usableFromInline
+    func trailersLength(_ trailers: HTTPFields) -> MessageLength {
+        self.messageLength(maxHeadFieldSection: nil, body: nil, trailers: trailers)
+    }
+
+    private func messageLength(maxHeadFieldSection: Int?, body: ByteBuffer?, trailers: HTTPFields?) -> MessageLength {
+        var maxLength = 0
+        if let maxHeadFieldSection {
+            maxLength &+= HTTP3EncodedLength.headersFrame(maxPayloadLength: maxHeadFieldSection)
+        }
+        if let body, body.readableBytes > 0 {
+            maxLength &+= Self.dataFrameLength(copying: body)
+        }
+        let maxTrailersFieldSection = trailers.map { HTTP3MessageEncoding.maxFieldSectionLength(of: $0) }
+        if let maxTrailersFieldSection {
+            maxLength &+= HTTP3EncodedLength.headersFrame(maxPayloadLength: maxTrailersFieldSection)
+        }
+        return MessageLength(
+            maxHeadFieldSection: maxHeadFieldSection,
+            maxTrailersFieldSection: maxTrailersFieldSection,
+            maxLength: maxLength
+        )
+    }
+
+    /// Appends the frames of `head`, a copy of `body` if it isn't empty, and `trailers`.
+    ///
+    /// - Precondition: `length` is ``messageLength(_:body:trailers:)-(HTTPRequest,_,_)`` of the same message, and
+    ///   `output` has room for its ``MessageLength/maxLength``.
+    @usableFromInline
+    func appendMessage(
+        _ head: HTTPRequest,
+        body: ByteBuffer?,
+        trailers: HTTPFields?,
+        length: MessageLength,
+        into output: inout OutputRawSpan
+    ) {
+        HTTP3MessageEncoding.appendHeadersFrame(
+            request: head,
+            maxFieldSectionLength: length.maxHeadFieldSection!,
+            into: &output,
+            preferHuffmanEncoding: self.configuration.preferHuffmanEncoding
+        )
+        self.appendBodyAndTrailers(body: body, trailers: trailers, length: length, into: &output)
+    }
+
+    /// Appends the frames of `head`, a copy of `body` if it isn't empty, and `trailers`.
+    ///
+    /// - Precondition: `length` is ``messageLength(_:body:trailers:)-(HTTPResponse,_,_)`` of the same message, and
+    ///   `output` has room for its ``MessageLength/maxLength``.
+    @usableFromInline
+    func appendMessage(
+        _ head: HTTPResponse,
+        body: ByteBuffer?,
+        trailers: HTTPFields?,
+        length: MessageLength,
+        into output: inout OutputRawSpan
+    ) {
+        HTTP3MessageEncoding.appendHeadersFrame(
+            response: head,
+            maxFieldSectionLength: length.maxHeadFieldSection!,
+            into: &output,
+            preferHuffmanEncoding: self.configuration.preferHuffmanEncoding
+        )
+        self.appendBodyAndTrailers(body: body, trailers: trailers, length: length, into: &output)
+    }
+
+    /// Appends the HEADERS frame of `trailers`.
+    ///
+    /// - Precondition: `length` is ``trailersLength(_:)`` of `trailers`, and `output` has room for its
+    ///   ``MessageLength/maxLength``.
+    @usableFromInline
+    func appendTrailers(_ trailers: HTTPFields, length: MessageLength, into output: inout OutputRawSpan) {
+        self.appendBodyAndTrailers(body: nil, trailers: trailers, length: length, into: &output)
+    }
+
+    private func appendBodyAndTrailers(
+        body: ByteBuffer?,
+        trailers: HTTPFields?,
+        length: MessageLength,
+        into output: inout OutputRawSpan
+    ) {
+        if let body, body.readableBytes > 0 {
+            Self.appendDataFrame(copying: body, into: &output)
+        }
+        if let trailers {
+            HTTP3MessageEncoding.appendHeadersFrame(
+                trailers: trailers,
+                maxFieldSectionLength: length.maxTrailersFieldSection!,
+                into: &output,
+                preferHuffmanEncoding: self.configuration.preferHuffmanEncoding
+            )
+        }
+    }
+
+    /// The number of bytes a DATA frame carrying a copy of `body` takes.
+    @usableFromInline
+    static func dataFrameLength(copying body: ByteBuffer) -> Int {
+        HTTP3EncodedLength.dataFrameHeader(payloadLength: body.readableBytes) &+ body.readableBytes
+    }
+
+    /// Appends a DATA frame carrying a copy of `body`.
+    ///
+    /// - Precondition: `output` has room for ``dataFrameLength(copying:)`` of `body`.
+    @usableFromInline
+    static func appendDataFrame(copying body: ByteBuffer, into output: inout OutputRawSpan) {
+        output.appendHTTP3DataFrameHeader(payloadLength: body.readableBytes)
+        precondition(output.freeCapacity >= body.readableBytes, "Not enough room for the DATA frame's payload")
+        body.withUnsafeReadableBytes { source in
+            output.withUnsafeMutableBytes { buffer, initializedCount in
+                UnsafeMutableRawBufferPointer(rebasing: buffer[initializedCount...]).copyMemory(from: source)
+                initializedCount &+= source.count
             }
         }
-        return count
-    }
-
-    @usableFromInline
-    func encodeHead(_ request: HTTPRequest) {
-        self.scratch.clear()
-        HTTP3MessageEncoding.writeHeadersFrame(
-            request: request,
-            into: &self.scratch,
-            preferHuffmanEncoding: self.configuration.preferHuffmanEncoding
-        )
-    }
-
-    @usableFromInline
-    func encodeHead(_ response: HTTPResponse) {
-        self.scratch.clear()
-        HTTP3MessageEncoding.writeHeadersFrame(
-            response: response,
-            into: &self.scratch,
-            preferHuffmanEncoding: self.configuration.preferHuffmanEncoding
-        )
-    }
-
-    /// Encodes `head`, `body` and `trailers`, to be sent together.
-    @usableFromInline
-    func encodeResponse(_ head: HTTPResponse, body: ByteBuffer?, trailers: HTTPFields?) {
-        self.encodeHead(head)
-        if let body, body.readableBytes > 0 {
-            self.appendDataFrame(copying: body)
-        }
-        if let trailers {
-            self.appendTrailers(trailers)
-        }
-    }
-
-    /// Encodes `head`, `body` and `trailers`, to be sent together.
-    @usableFromInline
-    func encodeRequest(_ head: HTTPRequest, body: ByteBuffer?, trailers: HTTPFields?) {
-        self.encodeHead(head)
-        if let body, body.readableBytes > 0 {
-            self.appendDataFrame(copying: body)
-        }
-        if let trailers {
-            self.appendTrailers(trailers)
-        }
-    }
-
-    @usableFromInline
-    func encodeTrailers(_ trailers: HTTPFields) {
-        self.scratch.clear()
-        self.appendTrailers(trailers)
-    }
-
-    /// Encodes a DATA frame carrying a copy of `body`.
-    @usableFromInline
-    func encodeDataFrame(copying body: ByteBuffer) {
-        self.scratch.clear()
-        self.appendDataFrame(copying: body)
-    }
-
-    /// Encodes the header of a DATA frame whose payload is written separately.
-    @usableFromInline
-    func encodeDataFrameHeader(payloadLength: Int) {
-        self.scratch.clear()
-        HTTP3MessageEncoding.writeDataFrameHeader(payloadLength: payloadLength, into: &self.scratch)
-    }
-
-    private func appendDataFrame(copying body: ByteBuffer) {
-        HTTP3MessageEncoding.writeDataFrameHeader(payloadLength: body.readableBytes, into: &self.scratch)
-        self.scratch.writeImmutableBuffer(body)
-    }
-
-    private func appendTrailers(_ trailers: HTTPFields) {
-        HTTP3MessageEncoding.writeHeadersFrame(
-            trailers: trailers,
-            into: &self.scratch,
-            preferHuffmanEncoding: self.configuration.preferHuffmanEncoding
-        )
     }
 
     /// The length of the header of a DATA frame with a payload of `payloadLength` bytes.
     @usableFromInline
     static func dataFrameHeaderLength(payloadLength: Int) -> Int {
-        HTTP3MessageEncoding.dataFrameHeaderLength(payloadLength: payloadLength)
+        HTTP3EncodedLength.dataFrameHeader(payloadLength: payloadLength)
+    }
+
+    /// Appends the header of a DATA frame whose payload is written separately.
+    ///
+    /// - Precondition: `output` has room for ``dataFrameHeaderLength(payloadLength:)``.
+    @usableFromInline
+    static func appendDataFrameHeader(payloadLength: Int, into output: inout OutputRawSpan) {
+        output.appendHTTP3DataFrameHeader(payloadLength: payloadLength)
     }
 
     /// Decodes the field section of a HEADERS frame.
@@ -363,12 +427,19 @@ final class HTTP3ConnectionContext {
 
     // MARK: Control stream
 
-    /// Encodes the start of this endpoint's control stream: its type and the SETTINGS frame.
+    /// The number of bytes ``appendControlStreamPreamble(into:)`` appends.
     @usableFromInline
-    func encodeControlStreamPreamble() {
-        self.scratch.clear()
-        self.scratch.writeEncodedInteger(HTTP3StreamType.Unidirectional.control.rawValue, strategy: .quic)
-        HTTP3MessageEncoding.writeFrame(.settings(self.localSettings), into: &self.scratch)
+    var controlStreamPreambleLength: Int {
+        HTTP3EncodedLength.streamType(.control) &+ HTTP3EncodedLength.settingsFrame(self.localSettings)
+    }
+
+    /// Appends the start of this endpoint's control stream: its type and the SETTINGS frame.
+    ///
+    /// - Precondition: `output` has room for ``controlStreamPreambleLength``.
+    @usableFromInline
+    func appendControlStreamPreamble(into output: inout OutputRawSpan) {
+        output.appendHTTP3StreamType(.control)
+        output.appendHTTP3SettingsFrame(self.localSettings)
     }
 
     @usableFromInline
@@ -707,9 +778,12 @@ final class HTTP3ConnectionContext {
     /// What a GOAWAY requires of the streams.
     @usableFromInline
     struct GoawayAction {
-        /// The GOAWAY frame to write to the control stream, already encoded into ``scratch``.
+        /// The control stream to write the GOAWAY frame to.
         @usableFromInline
         var controlStream: QUICStreamHandle?
+        /// The ID the GOAWAY frame carries.
+        @usableFromInline
+        var goawayID: HTTP3GoawayID
         /// The requests which will no longer be processed.
         @usableFromInline
         var cancel: [QUICStreamID]
@@ -741,10 +815,9 @@ final class HTTP3ConnectionContext {
         case .some(.sendGoaway(let id, let idsToCancel, _)):
             self.isQuiescing = true
             self.logger.trace("Sending GOAWAY", metadata: ["h3.goaway.id": "\(id)"])
-            self.scratch.clear()
-            HTTP3MessageEncoding.writeFrame(.goaway(id), into: &self.scratch)
             return GoawayAction(
                 controlStream: self.outboundControlStream,
+                goawayID: id,
                 cancel: idsToCancel,
                 closeNow: final && self.openRequestStreams == 0
             )
@@ -757,6 +830,20 @@ final class HTTP3ConnectionContext {
         case .none:
             return nil
         }
+    }
+
+    /// The number of bytes ``appendGoawayFrame(_:into:)`` appends.
+    @usableFromInline
+    static func goawayFrameLength(_ id: HTTP3GoawayID) -> Int {
+        HTTP3EncodedLength.goawayFrame(id)
+    }
+
+    /// Appends a GOAWAY frame carrying `id`.
+    ///
+    /// - Precondition: `output` has room for ``goawayFrameLength(_:)``.
+    @usableFromInline
+    static func appendGoawayFrame(_ id: HTTP3GoawayID, into output: inout OutputRawSpan) {
+        output.appendHTTP3GoawayFrame(id)
     }
 
     /// Closes the connection once shutdown has finished.

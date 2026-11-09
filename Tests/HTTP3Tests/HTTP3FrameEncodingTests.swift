@@ -235,7 +235,7 @@ struct HTTP3FrameEncodingTests {
 ///
 /// Writing more than `length` bytes traps, so a length which is too small fails the test.
 @available(anyAppleOS 27, *)
-private func encodeWithExactRoom(_ length: Int, _ encode: (inout OutputRawSpan) -> Void) -> [UInt8] {
+func encodeWithExactRoom(_ length: Int, _ encode: (inout OutputRawSpan) -> Void) -> [UInt8] {
     var bytes = [UInt8](repeating: 0, count: length)
     let written = bytes.withUnsafeMutableBytes { buffer in
         var output = OutputRawSpan(buffer: buffer, initializedCount: 0)
