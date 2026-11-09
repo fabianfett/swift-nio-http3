@@ -79,9 +79,11 @@ struct HTTP3StreamStateMachineTests {
     @available(anyAppleOS 27, *)
     private func writtenHeadersFrameBytes(_ fields: [HTTPField]) -> [UInt8] {
         let encoder = StaticQPACKEncoder()
-        var buffer = ByteBuffer()
-        buffer.writeHeadersFrame(maxPayloadLength: encoder.maxEncodedLength(of: fields)) {
-            encoder.encode(headers: fields, into: &$0, preferHuffmanEncoding: false)
+        let maxPayloadLength = encoder.maxEncodedLength(of: fields)
+        let buffer = ByteBuffer(initialCapacity: HTTP3EncodedLength.headersFrame(maxPayloadLength: maxPayloadLength)) {
+            $0.appendHTTP3HeadersFrame(maxPayloadLength: maxPayloadLength) { payload in
+                encoder.encode(headers: fields, into: &payload, preferHuffmanEncoding: false)
+            }
         }
         return .init(buffer: buffer)
     }

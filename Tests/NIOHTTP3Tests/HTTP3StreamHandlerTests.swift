@@ -360,8 +360,8 @@ struct NIOHTTP3StreamHandlerTests {
         // write out a settings frame
         try channel.writeOutbound(HTTP3Frame.settings(.init()))
         let writtenBytes = try recorderPromise.futureResult.wait()
-        // The type is 4, the length is 0, but the 0 is encoded in 2 bytes because of how `ByteBuffer/writeLengthPrefixed` works
-        #expect(writtenBytes == [.init(bytes: [4, 0x40, 0])])
+        // The type is 4, the length is 0
+        #expect(writtenBytes == [.init(bytes: [4, 0])])
     }
 
     /// Write headers which the encoder inserts into its dynamic table. The peer's decoder must learn of the entry on
@@ -657,8 +657,13 @@ struct NIOHTTP3StreamHandlerTests {
         #expect(handler.unwrapOutboundIn(headerReadEvent) == self.testRequestHeaderFrame)
         #expect(seenEvents.popFirst()?.isChannelReadComplete == true)
 
-        var dataBytes = ByteBuffer()
-        dataBytes.writeHTTP3PartialFrame(.data(.init(string: "hello world")))
+        let payload = ByteBuffer(string: "hello world")
+        var dataBytes = ByteBuffer(
+            initialCapacity: HTTP3EncodedLength.dataFrameHeader(payloadLength: payload.readableBytes)
+        ) {
+            $0.appendHTTP3DataFrameHeader(payloadLength: payload.readableBytes)
+        }
+        dataBytes.writeImmutableBuffer(payload)
         channel.pipeline.fireChannelRead(dataBytes)
         // We do not fire a read complete. So the bytes get buffered, but nothing comes out.
         #expect(seenEvents.isEmpty())

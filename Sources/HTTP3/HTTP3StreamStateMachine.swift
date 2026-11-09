@@ -389,8 +389,7 @@ public struct HTTP3StreamStateMachine: ~Copyable {
         mutating func write(frame: HTTP3Frame, into buffer: inout ByteBuffer) -> WriteAction {
             switch consume self.state {
             case .idle(let idleState):
-                let maybePartial = MaybePartialFrame(frame)
-                switch maybePartial {
+                switch frame {
                 case .headers(let headers):
                     self = .init(state: .waitingForEncode(.init(idleState: idleState)))
                     return .encodeHeaders(headers.fields)
@@ -402,11 +401,39 @@ public struct HTTP3StreamStateMachine: ~Copyable {
                     // expose push streams or the max push id yet. Therefore we forbid writing them in the validator.
                     // So it won't get this far.
                     fatalError("Tried to write a push promise, which is not supported")
-                case .partial(let partial):
-                    buffer.writeHTTP3PartialFrame(partial)
-                    self = .init(state: .idle(idleState))
-                    return .wroteBytes
+                case .data(let data):
+                    let payloadLength = data.payload.readableBytes
+                    buffer.writeWithOutputRawSpan(
+                        minimumWritableBytes: HTTP3EncodedLength.dataFrameHeader(payloadLength: payloadLength)
+                    ) {
+                        $0.appendHTTP3DataFrameHeader(payloadLength: payloadLength)
+                    }
+                    buffer.writeImmutableBuffer(data.payload)
+                case .settings(let settings):
+                    buffer.writeWithOutputRawSpan(
+                        minimumWritableBytes: HTTP3EncodedLength.settingsFrame(settings.settings)
+                    ) {
+                        $0.appendHTTP3SettingsFrame(settings.settings)
+                    }
+                case .goaway(let goaway):
+                    buffer.writeWithOutputRawSpan(minimumWritableBytes: HTTP3EncodedLength.goawayFrame(goaway.id)) {
+                        $0.appendHTTP3GoawayFrame(goaway.id)
+                    }
+                case .maxPushID(let maxPushID):
+                    buffer.writeWithOutputRawSpan(
+                        minimumWritableBytes: HTTP3EncodedLength.maxPushIDFrame(maxPushID.id)
+                    ) {
+                        $0.appendHTTP3MaxPushIDFrame(maxPushID.id)
+                    }
+                case .cancelPush(let cancelPush):
+                    buffer.writeWithOutputRawSpan(
+                        minimumWritableBytes: HTTP3EncodedLength.cancelPushFrame(cancelPush.pushID)
+                    ) {
+                        $0.appendHTTP3CancelPushFrame(cancelPush.pushID)
+                    }
                 }
+                self = .init(state: .idle(idleState))
+                return .wroteBytes
             case .waitingForEncode:
                 fatalError("Cannot call write whilst waiting for a QPACK encode result")
             }
@@ -426,8 +453,12 @@ public struct HTTP3StreamStateMachine: ~Copyable {
             case .idle:
                 fatalError("Unexpected header encode")
             case .waitingForEncode(let waitingState):
-                buffer.writeHeadersFrame(maxPayloadLength: maxPayloadLength) { output in
-                    encodePayload(&output, waitingState.preferHuffmanEncoding)
+                buffer.writeWithOutputRawSpan(
+                    minimumWritableBytes: HTTP3EncodedLength.headersFrame(maxPayloadLength: maxPayloadLength)
+                ) { output in
+                    output.appendHTTP3HeadersFrame(maxPayloadLength: maxPayloadLength) { payload in
+                        encodePayload(&payload, waitingState.preferHuffmanEncoding)
+                    }
                 }
                 self = .init(state: .idle(.init(preferHuffmanEncoding: waitingState.preferHuffmanEncoding)))
                 return .wroteBytes
@@ -837,29 +868,6 @@ public struct HTTP3StreamStateMachine: ~Copyable {
 
         case .finished:
             fatalError("Finished called twice")
-        }
-    }
-}
-
-/// A HTTP3Frame can be made into a HTTP3PartialFrame trivially, if it is not headers or push promise. This enum represents those 3 possibilities.
-@available(anyAppleOS 27, *)
-private enum MaybePartialFrame {
-    /// The frame is headers.
-    case headers(HTTP3Frame.Headers)
-    /// The frame is a push promise.
-    case pushPromise(HTTP3Frame.PushPromise)
-    /// The frame is not headers nor push promise, and therefore can be represented as a ``HTTP3PartialFrame``.
-    case partial(HTTP3PartialFrame)
-
-    init(_ full: HTTP3Frame) {
-        switch full {
-        case .headers(let partialHeaders): self = .headers(partialHeaders)
-        case .data(let data): self = .partial(.data(data))
-        case .settings(let settings): self = .partial(.settings(settings))
-        case .goaway(let goaway): self = .partial(.goaway(goaway))
-        case .maxPushID(let maxPushID): self = .partial(.maxPushID(maxPushID))
-        case .pushPromise(let pushPromise): self = .pushPromise(pushPromise)
-        case .cancelPush(let cancelPush): self = .partial(.cancelPush(cancelPush))
         }
     }
 }

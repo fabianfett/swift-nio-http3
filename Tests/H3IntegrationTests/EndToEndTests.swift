@@ -695,8 +695,10 @@ struct EndToEndTests {
                 type: HTTP3ConnectionCoordinator<NIOQUIC.QUICStreamCreator>.StreamHandler.self
             )
             let streamHandlerContext = try requestStreamChannel.pipeline.syncOperations.context(handler: streamHandler)
-            var buffer = ByteBuffer()
-            buffer.writeHTTP3PartialFrame(.settings(HTTP3Settings()))
+            let settings = HTTP3Settings()
+            let buffer = ByteBuffer(initialCapacity: HTTP3EncodedLength.settingsFrame(settings)) {
+                $0.appendHTTP3SettingsFrame(settings)
+            }
             streamHandlerContext.writeAndFlush(NIOAny(buffer), promise: nil)
         }
 
