@@ -19,8 +19,10 @@ enum HTTP3FrameValidator: ~Copyable {
     case outgoingControlStream(OutgoingControlStreamValidator)
     case incomingPushStream(IncomingPushStreamValidator)
     case outgoingPushStream(OutgoingPushStreamValidator)
-    case incomingRequestStream(ServerRequestStreamValidator)
-    case outgoingRequestStream(ClientRequestStreamValidator)
+    /// A request stream on a server.
+    case incomingRequestStream(RequestStreamValidator)
+    /// A request stream on a client.
+    case outgoingRequestStream(RequestStreamValidator)
 
     /// Checks the order of frames is valid for a control stream.
     /// I.e. first the settings, and then anything but settings after that.
@@ -173,286 +175,6 @@ enum HTTP3FrameValidator: ~Copyable {
         }
     }
 
-    /// Checks the order of frames read and written is correct for a request stream.
-    /// It looks at both request and response frames.
-    /// When using this validator for a client, the request frames are the outbound and the response frames are inbound.
-    /// This is reversed for a server.
-    private struct RequestStreamValidator: ~Copyable {
-        /// Models the state of one side of the connection.
-        enum State {
-            /// Nothing has happened yet.
-            case idle
-            /// Headers have been processed. We may or may not have also received data.
-            case headersProcessed
-            /// Trailers have been processed. Nothing more should be received now.
-            case trailersProcessed
-            /// We previously hit an error so we're refusing to do anything now.
-            case previousError
-        }
-
-        private var requestState: State
-        private var responseState: State
-
-        private init(requestState: consuming State, responseState: consuming State) {
-            self.requestState = requestState
-            self.responseState = responseState
-        }
-
-        init() {
-            self.init(requestState: .idle, responseState: .idle)
-        }
-
-        mutating func processResponseFrame(_ frame: HTTP3Frame) -> ProcessFrameAction {
-            let existingRequestState = self.requestState
-            let existingResponseState = self.responseState
-            _ = consume self  // Force us to always choose a new state
-            switch (existingRequestState, existingResponseState) {
-            case (.idle, _):
-                // There is no request yet, we can't have a response
-                self = .init(requestState: existingRequestState, responseState: .previousError)
-                return .emitStreamError(
-                    HTTP3Error(
-                        code: .malformedMessage,
-                        message: "A HTTP response was sent before a request",
-                        cause: nil,
-                        errorCode: .messageError,
-                        location: .here()
-                    )
-                )
-            case (.previousError, _), (_, .previousError):
-                // we previously hit an error, so we refuse to do anything now
-                self = .init(requestState: existingRequestState, responseState: existingResponseState)
-                return .previousError
-            case (.headersProcessed, .idle), (.trailersProcessed, .idle):
-                // response side is idle, so we haven't received anything yet. Expect head
-                switch frame {
-                case .headers(let headers):
-                    // A response MAY consist of multiple messages when and only when one or more interim responses (1xx; see Section 15.2 of [HTTP]) precede a final response to the same request.
-                    // Interim responses do not contain content or trailer sections.
-                    if headers.representsInterimResponse {
-                        // This header doesn't affect our state because it's interim. We just pass it through
-                        self = .init(requestState: existingRequestState, responseState: existingResponseState)
-                        return .forwardFrame(frame)
-                    } else {
-                        self = .init(requestState: existingRequestState, responseState: .headersProcessed)
-                        return .forwardFrame(frame)
-                    }
-                case .data, .pushPromise, .maxPushID, .goaway, .settings, .cancelPush:
-                    self = .init(requestState: existingRequestState, responseState: .previousError)
-                    return .emitConnectionError(
-                        HTTP3Error(
-                            code: .unexpectedFrame,
-                            message: "Expected headers, got \(frame.type)",
-                            cause: nil,
-                            errorCode: .frameUnexpected,
-                            location: .here()
-                        )
-                    )
-                }
-            case (.headersProcessed, .headersProcessed), (.trailersProcessed, .headersProcessed):
-                // response side is headersProcessed. Expect data or trailers
-                switch frame {
-                case .headers:
-                    // These are the trailers
-                    self = .init(requestState: existingRequestState, responseState: .trailersProcessed)
-                    return .forwardFrame(frame)
-                case .data:
-                    self = .init(requestState: existingRequestState, responseState: existingResponseState)
-                    return .forwardFrame(frame)
-                case .pushPromise, .maxPushID, .goaway, .settings, .cancelPush:
-                    self = .init(requestState: existingRequestState, responseState: .previousError)
-                    return .emitConnectionError(
-                        HTTP3Error(
-                            code: .unexpectedFrame,
-                            message: "Expected headers or data, got \(frame.type)",
-                            cause: nil,
-                            errorCode: .frameUnexpected,
-                            location: .here()
-                        )
-                    )
-                }
-            case (.headersProcessed, .trailersProcessed), (.trailersProcessed, .trailersProcessed):
-                switch frame {
-                case .cancelPush, .goaway, .maxPushID, .settings, .pushPromise, .data, .headers:
-                    // response side is trailersProcessed. We should not be receiving anything more
-                    self = .init(requestState: existingRequestState, responseState: .previousError)
-                    return .emitConnectionError(
-                        HTTP3Error(
-                            code: .unexpectedFrame,
-                            message: "Expected no further frames after response trailers, got \(frame.type)",
-                            cause: nil,
-                            errorCode: .frameUnexpected,
-                            location: .here()
-                        )
-                    )
-                }
-            }
-        }
-
-        mutating func processRequestFrame(_ frame: HTTP3Frame) -> ProcessFrameAction {
-            // Receipt of an invalid sequence of frames MUST be treated as a connection error of type H3_FRAME_UNEXPECTED
-            let existingRequestState = self.requestState
-            let existingResponseState = self.responseState
-            _ = consume self  // Force us to always choose a new state
-            switch (existingRequestState, existingResponseState) {
-            case (.previousError, _), (_, .previousError):
-                // we previously hit an error, so we refuse to do anything now
-                self = .init(requestState: existingRequestState, responseState: existingResponseState)
-                return .previousError
-            case (.idle, _):
-                // This should be headers
-                switch frame {
-                case .headers:
-                    self = .init(requestState: .headersProcessed, responseState: existingResponseState)
-                    return .forwardFrame(frame)
-                case .cancelPush, .goaway, .maxPushID, .settings, .pushPromise, .data:
-                    self = .init(requestState: .previousError, responseState: existingResponseState)
-                    return .emitConnectionError(
-                        HTTP3Error(
-                            code: .unexpectedFrame,
-                            message: "Expected headers, got \(frame.type)",
-                            cause: nil,
-                            errorCode: .frameUnexpected,
-                            location: .here()
-                        )
-                    )
-                }
-            case (.headersProcessed, _):
-                // This should be data or trailers
-                switch frame {
-                case .headers:
-                    // these are the trailers
-                    self = .init(requestState: .trailersProcessed, responseState: existingResponseState)
-                    return .forwardFrame(frame)
-                case .data:
-                    // This is the body. State stays as-is, we can have any number of data frames
-                    self = .init(requestState: existingRequestState, responseState: existingResponseState)
-                    return .forwardFrame(frame)
-                case .cancelPush, .goaway, .maxPushID, .settings, .pushPromise:
-                    // Any other frame is an error
-                    self = .init(requestState: .previousError, responseState: existingResponseState)
-                    return .emitConnectionError(
-                        HTTP3Error(
-                            code: .unexpectedFrame,
-                            message: "Expected headers or data, got \(frame.type)",
-                            cause: nil,
-                            errorCode: .frameUnexpected,
-                            location: .here()
-                        )
-                    )
-                }
-            case (.trailersProcessed, _):
-                switch frame {
-                case .cancelPush, .goaway, .maxPushID, .settings, .pushPromise, .data, .headers:
-                    // We already got request trailers, so nothing more can go in the request now
-                    self = .init(requestState: .previousError, responseState: existingResponseState)
-                    return .emitConnectionError(
-                        HTTP3Error(
-                            code: .unexpectedFrame,
-                            message: "Expected no further frames after request trailers, got \(frame.type)",
-                            cause: nil,
-                            errorCode: .frameUnexpected,
-                            location: .here()
-                        )
-                    )
-                }
-            }
-        }
-
-        /// Whether the complete request has been received.
-        private var receivedCompleteRequest: Bool {
-            switch self.requestState {
-            case .idle:
-                // We haven't received the request head part yet, so the request is trivially incomplete.
-                return false
-
-            case .headersProcessed:
-                // TODO: If a Content-Length header was specified, we need to check whether we have received all the
-                // specified bytes. If that is not the case, then the request is malformed per RFC 9114 § 4.1.2, and it
-                // must be treated as a stream error.
-                return true
-
-            case .trailersProcessed:
-                // If we have processed trailers, we have seen the full request.
-                return true
-
-            case .previousError:
-                // There was already an error. That will result in the stream closing anyway, so just return `true`.
-                return true
-            }
-        }
-
-        /// Whether the complete response has been received.
-        private var receivedCompleteResponse: Bool {
-            switch self.responseState {
-            case .idle:
-                // We haven't received a final response head part yet, so the response is trivially incomplete.
-                return false
-
-            case .headersProcessed:
-                // TODO: If a Content-Length header was specified, we need to check whether we have received all the
-                // specified bytes. If that is not the case, then the request is malformed per RFC 9114 § 4.1.2, and it
-                // must be treated as a stream error.
-                return true
-
-            case .trailersProcessed:
-                // If we have processed trailers, we have seen the full response.
-                return true
-
-            case .previousError:
-                // There was already an error. That will result in the stream closing anyway, so just return `true`.
-                return true
-            }
-        }
-
-        /// Records that the inbound request stream has closed.
-        mutating func processInboundRequestStreamClosed() -> InboundClosedAction {
-            if self.receivedCompleteRequest {
-                return .doNothing
-            }
-
-            // The input closed before we saw a *complete* request. Per RFC 9114 § 4.1:
-            // "If a client-initiated stream terminates without enough of the HTTP message to provide a complete
-            //  response, the server SHOULD abort its response stream with the error code H3\_REQUEST\_INCOMPLETE".
-            //
-            // We therefore need to reset the stream.
-            self = .init(requestState: .previousError, responseState: .previousError)
-
-            return .resetStream(
-                HTTP3Error(
-                    code: .peerTerminatedInboundStream,
-                    message: "Inbound request stream closed before a complete request was received",
-                    cause: nil,
-                    errorCode: .requestIncomplete,
-                    location: .here()
-                )
-            )
-        }
-
-        /// Records that the inbound response stream has closed.
-        func processInboundResponseStreamClosed() -> InboundClosedAction {
-            if self.receivedCompleteResponse {
-                return .doNothing
-            }
-
-            // The input closed before we saw a *complete* response. Per RFC 9114 § 4.1.1:
-            // "... if a stream is cancelled after receiving a partial response, the response SHOULD NOT be used".
-            //
-            // We therefore need to inform the downstream so they can decide what to do with the incomplete response.
-            //
-            // This is not a stream or connection error, so we don't modify the request or response state.
-            return .notifyDownstream(
-                HTTP3Error(
-                    code: .peerTerminatedInboundStream,
-                    message: "Inbound response stream closed before a complete response was received",
-                    cause: nil,
-                    errorCode: nil,
-                    location: .here()
-                )
-            )
-        }
-    }
-
     /// The action to take when the inbound side of a stream closes.
     enum InboundClosedAction {
         /// We received the full request or response before the inbound closed. As such, there is nothing to do.
@@ -467,41 +189,110 @@ enum HTTP3FrameValidator: ~Copyable {
         case resetStream(HTTP3Error)
     }
 
-    struct ServerRequestStreamValidator: ~Copyable {
-        private var underlying = RequestStreamValidator()
+    /// Checks the order of frames read and written is correct for a request stream, by mapping them to the message
+    /// events of a ``HTTP3RequestStreamValidator``.
+    ///
+    /// For a server, the request frames are inbound and the response frames are outbound. This is reversed for a
+    /// client.
+    ///
+    /// Unlike the other validators, this one doesn't remember errors: ``HTTP3StreamStateMachine`` stops using the
+    /// validator once it reported one.
+    struct RequestStreamValidator {
+        /// A frame type the frame decoder doesn't know. The decoder doesn't keep the type of an unknown frame, but any
+        /// will do: they are all treated the same (RFC 9114 § 9). This one is reserved (RFC 9114 § 7.2.8).
+        private static let unknownFrameType = HTTP3FrameType.unknown(type: 0x21)
 
-        /// Validates an inbound request frame.
+        private var validator: HTTP3RequestStreamValidator
+
+        init(isServer: Bool) {
+            self.validator = HTTP3RequestStreamValidator(isServer: isServer)
+        }
+
+        /// Validates an inbound frame.
         mutating func processInboundFrame(_ frame: HTTP3Frame) -> ProcessFrameAction {
-            self.underlying.processRequestFrame(frame)
+            switch self.validator.receivedFrame(frame.type) {
+            case .decodeHead:
+                // The channel API validates HEADERS frames after QPACK decoding them, so the head's fields are already
+                // here. Only a client receives (interim) responses.
+                let informational: Bool
+                if !self.validator.isServer, case .headers(let headers) = frame {
+                    informational = headers.representsInterimResponse
+                } else {
+                    informational = false
+                }
+                self.validator.receivedHead(informational: informational)
+                return .forwardFrame(frame)
+            case .decodeTrailers, .body:
+                return .forwardFrame(frame)
+            case .ignore:
+                preconditionFailure("An HTTP3Frame is never of an unknown type")
+            case .connectionError(let error):
+                return .emitConnectionError(error)
+            case .streamError(let error):
+                return .emitStreamError(error)
+            }
         }
 
-        /// Validates an outbound response frame.
+        /// Validates an outbound frame.
         mutating func processOutboundFrame(_ frame: HTTP3Frame) -> ProcessFrameAction {
-            self.underlying.processResponseFrame(frame)
+            do throws(HTTP3Error) {
+                switch frame {
+                case .headers(let headers):
+                    if self.validator.outboundAwaitsHead {
+                        // Only a server writes (interim) responses.
+                        try self.validator.willWriteHead(
+                            informational: self.validator.isServer && headers.representsInterimResponse
+                        )
+                    } else {
+                        try self.validator.willWriteTrailers()
+                    }
+                case .data:
+                    try self.validator.willWriteBody()
+                case .cancelPush, .goaway, .maxPushID, .settings, .pushPromise:
+                    // RFC 9114 § 7.2: these frames are only allowed on the control stream. PUSH_PROMISE frames are
+                    // allowed on request streams, but this implementation doesn't support server push.
+                    throw Self.unwritableFrameError(type: frame.type, location: .here())
+                }
+                return .forwardFrame(frame)
+            } catch {
+                return .emitStreamError(error)
+            }
         }
 
-        /// Records that the inbound request stream has closed.
+        /// Validates an inbound frame of an unknown type.
+        mutating func processInboundUnknownFrame() -> UnknownFrameAction {
+            switch self.validator.receivedFrame(Self.unknownFrameType) {
+            case .ignore:
+                return .dropFrame
+            case .decodeHead, .decodeTrailers, .body, .connectionError, .streamError:
+                preconditionFailure("Frames of unknown types are always ignored")
+            }
+        }
+
+        /// Records that the inbound side of the stream has closed.
         mutating func processInboundClosed() -> InboundClosedAction {
-            self.underlying.processInboundRequestStreamClosed()
-        }
-    }
-
-    struct ClientRequestStreamValidator: ~Copyable {
-        private var underlying = RequestStreamValidator()
-
-        /// Validates an inbound response frame.
-        mutating func processInboundFrame(_ frame: HTTP3Frame) -> ProcessFrameAction {
-            self.underlying.processResponseFrame(frame)
+            switch self.validator.receivedEnd() {
+            case .complete:
+                return .doNothing
+            case .incompleteRequest(let error):
+                return .resetStream(error)
+            case .incompleteResponse(let error):
+                return .notifyDownstream(error)
+            }
         }
 
-        /// Validates an outbound request frame.
-        mutating func processOutboundFrame(_ frame: HTTP3Frame) -> ProcessFrameAction {
-            self.underlying.processRequestFrame(frame)
-        }
-
-        /// Records that the inbound response stream has closed.
-        func processInboundClosed() -> InboundClosedAction {
-            self.underlying.processInboundResponseStreamClosed()
+        @inline(never)
+        private static func unwritableFrameError(
+            type: HTTP3FrameType,
+            location: HTTP3Error.SourceLocation
+        ) -> HTTP3Error {
+            HTTP3Error(
+                code: .unexpectedFrame,
+                message: "A \(type) frame can't be written on a request stream",
+                cause: nil,
+                errorCode: nil,
+                location: location
+            )
         }
     }
 
@@ -612,10 +403,10 @@ enum HTTP3FrameValidator: ~Copyable {
     init(streamType: HTTP3StreamType.Framed, incoming: Bool) {
         switch (streamType, incoming) {
         case (.control, true): self = .incomingControlStream(.init())
-        case (.request, true): self = .incomingRequestStream(.init())
+        case (.request, true): self = .incomingRequestStream(.init(isServer: true))
         case (.push, true): self = .incomingPushStream(.init())
         case (.control, false): self = .outgoingControlStream(.init())
-        case (.request, false): self = .outgoingRequestStream(.init())
+        case (.request, false): self = .outgoingRequestStream(.init(isServer: false))
         case (.push, false): self = .outgoingPushStream(.init())
         }
     }
@@ -702,12 +493,14 @@ enum HTTP3FrameValidator: ~Copyable {
             let result = v.processInboundUnknownFrame()
             self = .outgoingControlStream(v)
             return result
-        case .incomingRequestStream(let v):
+        case .incomingRequestStream(var v):
+            let result = v.processInboundUnknownFrame()
             self = .incomingRequestStream(v)
-            return .dropFrame
-        case .outgoingRequestStream(let v):
+            return result
+        case .outgoingRequestStream(var v):
+            let result = v.processInboundUnknownFrame()
             self = .outgoingRequestStream(v)
-            return .dropFrame
+            return result
         case .incomingPushStream(let v):
             self = .incomingPushStream(v)
             return .dropFrame
@@ -719,13 +512,13 @@ enum HTTP3FrameValidator: ~Copyable {
 
     /// Records that the inbound side of the stream has closed.
     mutating func processInboundClosed() -> InboundClosedAction {
-        switch self {
+        switch consume self {
         case .incomingRequestStream(var validator):
             let result = validator.processInboundClosed()
             self = .incomingRequestStream(validator)
             return result
 
-        case .outgoingRequestStream(let validator):
+        case .outgoingRequestStream(var validator):
             let result = validator.processInboundClosed()
             self = .outgoingRequestStream(validator)
             return result

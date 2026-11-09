@@ -27,7 +27,8 @@ extension OutputRawSpan {
     ///
     /// - Precondition: The span has room for ``HTTP3EncodedLength/dataFrameHeader(payloadLength:)`` more bytes.
     @available(anyAppleOS 27, *)
-    mutating func appendHTTP3DataFrameHeader(payloadLength: Int) {
+    @_spi(PackageInternal)
+    public mutating func appendHTTP3DataFrameHeader(payloadLength: Int) {
         self.appendQUICVarint(HTTP3FrameType.data.rawValue)
         self.appendQUICVarint(UInt64(payloadLength))
     }
@@ -43,7 +44,8 @@ extension OutputRawSpan {
     ///     `maxPayloadLength` bytes.
     /// - Precondition: The span has room for ``HTTP3EncodedLength/headersFrame(maxPayloadLength:)`` more bytes.
     @available(anyAppleOS 27, *)
-    mutating func appendHTTP3HeadersFrame(maxPayloadLength: Int, encodePayload: (inout OutputRawSpan) -> Void) {
+    @_spi(PackageInternal)
+    public mutating func appendHTTP3HeadersFrame(maxPayloadLength: Int, encodePayload: (inout OutputRawSpan) -> Void) {
         precondition(maxPayloadLength >= 0, "Negative maximum payload length")
         self.appendQUICVarint(HTTP3FrameType.headers.rawValue)
         let lengthLength = HTTP3EncodedLength.quicVarint(UInt64(maxPayloadLength))
@@ -76,7 +78,8 @@ extension OutputRawSpan {
     ///
     /// - Precondition: The span has room for ``HTTP3EncodedLength/settingsFrame(_:)`` more bytes.
     @available(anyAppleOS 27, *)
-    mutating func appendHTTP3SettingsFrame(_ settings: HTTP3Settings) {
+    @_spi(PackageInternal)
+    public mutating func appendHTTP3SettingsFrame(_ settings: HTTP3Settings) {
         self.appendQUICVarint(HTTP3FrameType.settings.rawValue)
         self.appendQUICVarint(UInt64(HTTP3EncodedLength.settingsPayload(settings)))
         settings.forEachNonDefaultSetting { identifier, value in
@@ -89,7 +92,8 @@ extension OutputRawSpan {
     ///
     /// - Precondition: The span has room for ``HTTP3EncodedLength/goawayFrame(_:)`` more bytes.
     @available(anyAppleOS 27, *)
-    mutating func appendHTTP3GoawayFrame(_ id: HTTP3GoawayID) {
+    @_spi(PackageInternal)
+    public mutating func appendHTTP3GoawayFrame(_ id: HTTP3GoawayID) {
         self.appendHTTP3SingleIntegerFrame(type: .goaway, value: id.rawValue)
     }
 
@@ -97,7 +101,8 @@ extension OutputRawSpan {
     ///
     /// - Precondition: The span has room for ``HTTP3EncodedLength/maxPushIDFrame(_:)`` more bytes.
     @available(anyAppleOS 27, *)
-    mutating func appendHTTP3MaxPushIDFrame(_ id: HTTP3PushID) {
+    @_spi(PackageInternal)
+    public mutating func appendHTTP3MaxPushIDFrame(_ id: HTTP3PushID) {
         self.appendHTTP3SingleIntegerFrame(type: .maxPushID, value: id.rawValue)
     }
 
@@ -105,7 +110,8 @@ extension OutputRawSpan {
     ///
     /// - Precondition: The span has room for ``HTTP3EncodedLength/cancelPushFrame(_:)`` more bytes.
     @available(anyAppleOS 27, *)
-    mutating func appendHTTP3CancelPushFrame(_ id: HTTP3PushID) {
+    @_spi(PackageInternal)
+    public mutating func appendHTTP3CancelPushFrame(_ id: HTTP3PushID) {
         self.appendHTTP3SingleIntegerFrame(type: .cancelPush, value: id.rawValue)
     }
 
@@ -133,35 +139,41 @@ extension OutputRawSpan {
 @_spi(PackageInternal)
 public enum HTTP3EncodedLength {
     /// The number of bytes ``OutputRawSpan/appendHTTP3DataFrameHeader(payloadLength:)`` appends.
-    static func dataFrameHeader(payloadLength: Int) -> Int {
+    @_spi(PackageInternal)
+    public static func dataFrameHeader(payloadLength: Int) -> Int {
         Self.quicVarint(HTTP3FrameType.data.rawValue) &+ Self.quicVarint(UInt64(payloadLength))
     }
 
     /// The largest number of bytes ``OutputRawSpan/appendHTTP3HeadersFrame(maxPayloadLength:encodePayload:)`` appends.
-    static func headersFrame(maxPayloadLength: Int) -> Int {
+    @_spi(PackageInternal)
+    public static func headersFrame(maxPayloadLength: Int) -> Int {
         Self.quicVarint(HTTP3FrameType.headers.rawValue) &+ Self.quicVarint(UInt64(maxPayloadLength))
             &+ maxPayloadLength
     }
 
     /// The number of bytes ``OutputRawSpan/appendHTTP3SettingsFrame(_:)`` appends.
-    static func settingsFrame(_ settings: HTTP3Settings) -> Int {
+    @_spi(PackageInternal)
+    public static func settingsFrame(_ settings: HTTP3Settings) -> Int {
         let payloadLength = Self.settingsPayload(settings)
         return Self.quicVarint(HTTP3FrameType.settings.rawValue) &+ Self.quicVarint(UInt64(payloadLength))
             &+ payloadLength
     }
 
     /// The number of bytes ``OutputRawSpan/appendHTTP3GoawayFrame(_:)`` appends.
-    static func goawayFrame(_ id: HTTP3GoawayID) -> Int {
+    @_spi(PackageInternal)
+    public static func goawayFrame(_ id: HTTP3GoawayID) -> Int {
         Self.singleIntegerFrame(type: .goaway, value: id.rawValue)
     }
 
     /// The number of bytes ``OutputRawSpan/appendHTTP3MaxPushIDFrame(_:)`` appends.
-    static func maxPushIDFrame(_ id: HTTP3PushID) -> Int {
+    @_spi(PackageInternal)
+    public static func maxPushIDFrame(_ id: HTTP3PushID) -> Int {
         Self.singleIntegerFrame(type: .maxPushID, value: id.rawValue)
     }
 
     /// The number of bytes ``OutputRawSpan/appendHTTP3CancelPushFrame(_:)`` appends.
-    static func cancelPushFrame(_ id: HTTP3PushID) -> Int {
+    @_spi(PackageInternal)
+    public static func cancelPushFrame(_ id: HTTP3PushID) -> Int {
         Self.singleIntegerFrame(type: .cancelPush, value: id.rawValue)
     }
 

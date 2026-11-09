@@ -100,8 +100,8 @@ struct HTTP3FrameValidatorTests {
             expectedH3ErrorCode: .frameUnexpected,
             expectedMessage: "Expected headers, got \(testFrame.type)"
         )
-        // now, even sending valid headers will give no action due to previous error
-        #expect(validator.processInboundFrame(Self.validRequestHeaders()) == .previousError)
+        // The stream state machine remembers the error, not the validator: the rejected frame left its state as it was.
+        validator.assertInboundFramePassesThrough(Self.validRequestHeaders())
     }
 
     @available(anyAppleOS 27, *)
@@ -158,8 +158,8 @@ struct HTTP3FrameValidatorTests {
             expectedMessage: "Expected headers or data, got \(testFrame.type)"
         )
 
-        // now, even sending valid body will give no action due to previous error
-        #expect(validator.processInboundFrame(Self.makeTestDataFrame()) == .previousError)
+        // The stream state machine remembers the error, not the validator: the rejected frame left its state as it was.
+        validator.assertInboundFramePassesThrough(Self.makeTestDataFrame())
     }
 
     @Test(arguments: [
@@ -206,6 +206,19 @@ struct HTTP3FrameValidatorTests {
     @Test func testResponseBeforeRequest() {
         var validator = HTTP3FrameValidator(streamType: .request, incoming: true)
         let action = validator.processOutboundFrame(Self.validResponseHeaders())
+        // This is a misuse of our own API, so the error isn't sent to the peer.
+        expectH3ErrorEqual(
+            error: action.streamError,
+            expectedCode: .malformedMessage,
+            expectedH3ErrorCode: nil,
+            expectedMessage: "A HTTP response was sent before a request"
+        )
+    }
+
+    @available(anyAppleOS 27, *)
+    @Test func testInboundResponseBeforeRequest() {
+        var validator = HTTP3FrameValidator(streamType: .request, incoming: false)
+        let action = validator.processInboundFrame(Self.validResponseHeaders())
         expectH3ErrorEqual(
             error: action.streamError,
             expectedCode: .malformedMessage,
@@ -245,7 +258,6 @@ struct HTTP3FrameValidatorTests {
         .settings(.init()),
         .data(.init()),
         .maxPushID(1),
-        .pushPromise(.init(pushID: 12, httpFields: [:])),
     ])
     @available(anyAppleOS 27, *)
     func testInvalidResponse_anythingAfterTrailers(testFrame: HTTP3Frame) {
@@ -282,16 +294,17 @@ struct HTTP3FrameValidatorTests {
         validator.assertInboundFramePassesThrough(Self.validRequestHeaders())  // request headers
         validator.assertOutboundFramePassesThrough(Self.validResponseHeaders())  // response headers
 
+        // Writing them is a misuse of our own API, so the error isn't sent to the peer.
         let action2 = validator.processOutboundFrame(testFrame)
         expectH3ErrorEqual(
-            error: action2.connectionError,
+            error: action2.streamError,
             expectedCode: .unexpectedFrame,
-            expectedH3ErrorCode: .frameUnexpected,
-            expectedMessage: "Expected headers or data, got \(testFrame.type)"
+            expectedH3ErrorCode: nil,
+            expectedMessage: "A \(testFrame.type) frame can't be written on a request stream"
         )
 
-        // now, even sending valid body will give no action due to previous error
-        #expect(validator.processOutboundFrame(Self.makeTestDataFrame()) == .previousError)
+        // The stream state machine remembers the error, not the validator: the rejected frame left its state as it was.
+        validator.assertOutboundFramePassesThrough(Self.makeTestDataFrame())
     }
 
     @Test(arguments: [
@@ -300,7 +313,6 @@ struct HTTP3FrameValidatorTests {
         .settings(.init()),
         .data(.init()),
         .maxPushID(1),
-        .pushPromise(.init(pushID: 12, httpFields: [:])),
     ])
     @available(anyAppleOS 27, *)
     func testInvalidResponse_anythingBeforeHead(testFrame: HTTP3Frame) {
@@ -314,8 +326,28 @@ struct HTTP3FrameValidatorTests {
             expectedH3ErrorCode: .frameUnexpected,
             expectedMessage: "Expected headers, got \(testFrame.type)"
         )
-        // now, even sending valid headers will give no action due to previous error
-        #expect(validator.processInboundFrame(Self.validResponseHeaders()) == .previousError)
+        // The stream state machine remembers the error, not the validator: the rejected frame left its state as it was.
+        validator.assertInboundFramePassesThrough(Self.validResponseHeaders())
+    }
+
+    /// RFC 9114 § 7.2.5: we never send MAX_PUSH_ID, so any push ID a server uses is one we didn't allow.
+    @Test(arguments: 0...2)
+    @available(anyAppleOS 27, *)
+    func testInvalidResponse_pushPromise(framesBefore: Int) {
+        var validator = HTTP3FrameValidator(streamType: .request, incoming: false)
+        validator.assertOutboundFramePassesThrough(Self.validRequestHeaders())
+        // Before the head, after the head, and after the trailers.
+        for frame in [Self.validResponseHeaders(), Self.validTrailers()].prefix(framesBefore) {
+            validator.assertInboundFramePassesThrough(frame)
+        }
+
+        let action = validator.processInboundFrame(.pushPromise(.init(pushID: 1, httpFields: [:])))
+        expectH3ErrorEqual(
+            error: action.connectionError,
+            expectedCode: .unexpectedFrame,
+            expectedH3ErrorCode: .idError,
+            expectedMessage: "Unexpected push promise"
+        )
     }
 
     @available(anyAppleOS 27, *)
@@ -353,6 +385,95 @@ struct HTTP3FrameValidatorTests {
         validator.assertOutboundFramePassesThrough(.headers([.init(name: .status, value: "103")]))
         validator.assertOutboundFramePassesThrough(.headers([.init(name: .status, value: "200")]))
         validator.assertOutboundFramePassesThrough(.data(.init(bytes: [1, 2, 3])))
+    }
+
+    @available(anyAppleOS 27, *)
+    @Test func testOutboundRequestWithTrailers() {
+        var validator = HTTP3FrameValidator(streamType: .request, incoming: false)
+        validator.assertOutboundFramePassesThrough(Self.validRequestHeaders())
+        validator.assertOutboundFramePassesThrough(Self.makeTestDataFrame())
+        validator.assertOutboundFramePassesThrough(Self.validTrailers())
+
+        // The trailers ended the request.
+        expectH3ErrorEqual(
+            error: validator.processOutboundFrame(Self.makeTestDataFrame()).streamError,
+            expectedCode: .unexpectedFrame,
+            expectedH3ErrorCode: nil,
+            expectedMessage: "The message already ended"
+        )
+        expectH3ErrorEqual(
+            error: validator.processOutboundFrame(Self.validTrailers()).streamError,
+            expectedCode: .unexpectedFrame,
+            expectedH3ErrorCode: nil,
+            expectedMessage: "The message already ended"
+        )
+    }
+
+    @available(anyAppleOS 27, *)
+    @Test func testOutboundRequestDataBeforeHead() {
+        var validator = HTTP3FrameValidator(streamType: .request, incoming: false)
+        expectH3ErrorEqual(
+            error: validator.processOutboundFrame(Self.makeTestDataFrame()).streamError,
+            expectedCode: .unexpectedFrame,
+            expectedH3ErrorCode: nil,
+            expectedMessage: "The head must be written before the body"
+        )
+    }
+
+    /// A client's request head is never informational, even if it has a 1xx `:status`, so it starts the body.
+    @available(anyAppleOS 27, *)
+    @Test func testOutboundRequestIsNeverInterim() {
+        var validator = HTTP3FrameValidator(streamType: .request, incoming: false)
+        validator.assertOutboundFramePassesThrough(.headers([.init(name: .status, value: "103")]))
+        validator.assertOutboundFramePassesThrough(Self.makeTestDataFrame())
+    }
+
+    /// A server's request head is never informational, even if it has a 1xx `:status`, so it starts the body.
+    @available(anyAppleOS 27, *)
+    @Test func testInboundRequestIsNeverInterim() {
+        var validator = HTTP3FrameValidator(streamType: .request, incoming: true)
+        validator.assertInboundFramePassesThrough(.headers([.init(name: .status, value: "103")]))
+        validator.assertInboundFramePassesThrough(Self.makeTestDataFrame())
+    }
+
+    @available(anyAppleOS 27, *)
+    @Test func testInboundClosed() {
+        // A server which didn't get the request head resets the stream.
+        var server = HTTP3FrameValidator(streamType: .request, incoming: true)
+        guard case .resetStream(let error) = server.processInboundClosed() else {
+            Issue.record("Expected the stream to be reset")
+            return
+        }
+        expectH3ErrorEqual(
+            error: error,
+            expectedCode: .peerTerminatedInboundStream,
+            expectedH3ErrorCode: .requestIncomplete
+        )
+
+        // Once it got the head, the request is complete.
+        server = HTTP3FrameValidator(streamType: .request, incoming: true)
+        server.assertInboundFramePassesThrough(Self.validRequestHeaders())
+        guard case .doNothing = server.processInboundClosed() else {
+            Issue.record("Expected nothing to happen")
+            return
+        }
+
+        // A client which only got an interim response tells the user.
+        var client = HTTP3FrameValidator(streamType: .request, incoming: false)
+        client.assertOutboundFramePassesThrough(Self.validRequestHeaders())
+        client.assertInboundFramePassesThrough(.headers([.init(name: .status, value: "103")]))
+        guard case .notifyDownstream(let error) = client.processInboundClosed() else {
+            Issue.record("Expected the downstream to be notified")
+            return
+        }
+        expectH3ErrorEqual(error: error, expectedCode: .peerTerminatedInboundStream, expectedH3ErrorCode: nil)
+
+        // Once it got the final head, the response is complete.
+        client.assertInboundFramePassesThrough(Self.validResponseHeaders())
+        guard case .doNothing = client.processInboundClosed() else {
+            Issue.record("Expected nothing to happen")
+            return
+        }
     }
 
     @available(anyAppleOS 27, *)

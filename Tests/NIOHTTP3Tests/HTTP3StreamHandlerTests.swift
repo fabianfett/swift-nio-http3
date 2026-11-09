@@ -111,6 +111,21 @@ extension ByteBuffer {
     }
 }
 
+extension EventLoopFuture {
+    /// The value of a future on an `EmbeddedEventLoop` which must have completed already. Unlike `wait()`, this
+    /// doesn't hang if it hasn't.
+    fileprivate func completedValue() throws -> Value {
+        var result: Result<Value, any Error>?
+        self.assumeIsolated().whenComplete { result = $0 }
+        guard let result else {
+            throw FutureNotCompletedError()
+        }
+        return try result.get()
+    }
+}
+
+private struct FutureNotCompletedError: Error {}
+
 extension EmbeddedChannel {
     /// Drain everything a ``QPACKOutboundDecoderStream`` has written to this channel, decoded back into
     /// instructions.
@@ -225,10 +240,11 @@ struct NIOHTTP3StreamHandlerTests {
         // other connection error it finds.
         var connectionErrors: [HTTP3Error] = []
         let handler = HTTP3StreamHandler(
-            stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
+            stateMachine: .init(streamType: .request, incoming: true),
             streamID: 5,
             streamType: .request,
             qpackCoder: makeTestQPACKCoder(),
+            preferHuffmanEncoding: false,
             delegate: TestDelegate(onConnectionError: { connectionErrors.append($0) }),
             logger: self.logger
         )
@@ -262,10 +278,11 @@ struct NIOHTTP3StreamHandlerTests {
         #expect(try decoderStreamChannel.readOutbound(as: ByteBuffer.self) == nil)
 
         let handler = HTTP3StreamHandler(
-            stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
+            stateMachine: .init(streamType: .request, incoming: true),
             streamID: 5,
             streamType: .request,
             qpackCoder: qpackCoder,
+            preferHuffmanEncoding: false,
             delegate: TestDelegate(),
             logger: self.logger
         )
@@ -306,10 +323,11 @@ struct NIOHTTP3StreamHandlerTests {
     @available(anyAppleOS 27, *)
     @Test func receiveUnknownFrameFollowedByHeaders() throws {
         let handler = HTTP3StreamHandler(
-            stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
+            stateMachine: .init(streamType: .request, incoming: true),
             streamID: 5,
             streamType: .request,
             qpackCoder: makeTestQPACKCoder(),
+            preferHuffmanEncoding: false,
             delegate: TestDelegate(),
             logger: self.logger
         )
@@ -345,10 +363,11 @@ struct NIOHTTP3StreamHandlerTests {
     @available(anyAppleOS 27, *)
     @Test func write() throws {
         let handler = HTTP3StreamHandler(
-            stateMachine: .init(streamType: .control, incoming: false, preferHuffmanEncoding: false),
+            stateMachine: .init(streamType: .control, incoming: false),
             streamID: 5,
             streamType: .request,
             qpackCoder: makeTestQPACKCoder(),
+            preferHuffmanEncoding: false,
             delegate: TestDelegate(),
             logger: self.logger
         )
@@ -377,10 +396,11 @@ struct NIOHTTP3StreamHandlerTests {
         #expect(try encoderStreamChannel.readAllEncoderInstructions() == [.setDynamicTableCapacity(4096)])
 
         let handler = HTTP3StreamHandler(
-            stateMachine: .init(streamType: .request, incoming: false, preferHuffmanEncoding: false),
+            stateMachine: .init(streamType: .request, incoming: false),
             streamID: 4,
             streamType: .request,
             qpackCoder: qpackCoder,
+            preferHuffmanEncoding: false,
             delegate: TestDelegate(),
             logger: self.logger
         )
@@ -413,10 +433,11 @@ struct NIOHTTP3StreamHandlerTests {
     @available(anyAppleOS 27, *)
     @Test func writeStreamError() throws {
         let handler = HTTP3StreamHandler(
-            stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
+            stateMachine: .init(streamType: .request, incoming: true),
             streamID: 5,
             streamType: .request,
             qpackCoder: makeTestQPACKCoder(),
+            preferHuffmanEncoding: false,
             delegate: TestDelegate(),
             logger: self.logger
         )
@@ -426,24 +447,99 @@ struct NIOHTTP3StreamHandlerTests {
 
         let channel = EmbeddedChannel(handlers: [handler, errorRecorder], loop: eventLoop)
 
-        // write out response (invalid because we didn't get a request)
-        expectH3Error(code: .malformedMessage, h3ErrorCode: .messageError) {
+        // write out response (invalid because we didn't get a request). This is a misuse of our own API, so the
+        // error isn't sent to the peer.
+        #expect {
             try channel.writeOutbound(HTTP3Frame.headers([]))
+        } throws: { error in
+            let error = error as? HTTP3Error
+            return error?.code == .malformedMessage && error?.h3ErrorCode == nil
         }
-        expectH3Error(code: .malformedMessage, h3ErrorCode: .messageError) {
-            let thrownError = try errorPromise.futureResult.wait()
-            throw thrownError
+        let caughtError = try errorPromise.futureResult.completedValue()
+        expectH3ErrorEqual(error: caughtError, expectedCode: .malformedMessage, expectedH3ErrorCode: nil)
+        // Nothing was written.
+        #expect(try channel.readOutbound(as: ByteBuffer.self) == nil)
+    }
+
+    /// Write a frame which doesn't belong on a request stream.
+    @available(anyAppleOS 27, *)
+    @Test func writeControlFrameOnRequestStream() throws {
+        let handler = HTTP3StreamHandler(
+            stateMachine: .init(streamType: .request, incoming: false),
+            streamID: 4,
+            streamType: .request,
+            qpackCoder: makeTestQPACKCoder(),
+            preferHuffmanEncoding: false,
+            delegate: TestDelegate(),
+            logger: self.logger
+        )
+        let eventLoop = EmbeddedEventLoop()
+        let errorPromise = eventLoop.makePromise(of: (any Error).self)
+        let errorRecorder = InboundErrorRecorder(errorPromise: errorPromise)
+
+        let channel = EmbeddedChannel(handlers: [handler, errorRecorder], loop: eventLoop)
+
+        // A settings frame is a misuse of our own API, so the error isn't sent to the peer.
+        #expect {
+            try channel.writeOutbound(HTTP3Frame.settings(.init()))
+        } throws: { error in
+            let error = error as? HTTP3Error
+            return error?.code == .unexpectedFrame && error?.h3ErrorCode == nil
         }
+        let caughtError = try errorPromise.futureResult.completedValue()
+        expectH3ErrorEqual(error: caughtError, expectedCode: .unexpectedFrame, expectedH3ErrorCode: nil)
+        #expect(try channel.readOutbound(as: ByteBuffer.self) == nil)
+    }
+
+    /// The handler QPACK encodes the HEADERS frames it writes with its Huffman preference.
+    @available(anyAppleOS 27, *)
+    @Test(arguments: [true, false])
+    func writeHeadersWithHuffmanPreference(preferHuffmanEncoding: Bool) throws {
+        let handler = HTTP3StreamHandler(
+            stateMachine: .init(streamType: .request, incoming: false),
+            streamID: 4,
+            streamType: .request,
+            // Without the peer's settings the encoder can't use the dynamic table, so it writes what the static
+            // encoder writes.
+            qpackCoder: makeTestQPACKCoder(),
+            preferHuffmanEncoding: preferHuffmanEncoding,
+            delegate: TestDelegate(),
+            logger: self.logger
+        )
+        let channel = EmbeddedChannel(handlers: [handler])
+
+        try channel.writeOutbound(self.testRequestHeaderFrame)
+
+        var frameBytes = try #require(try channel.readOutbound(as: ByteBuffer.self))
+        var frameDecoder = HTTP3FrameDecoder()
+        let frame = try frameDecoder.decode(buffer: &frameBytes)
+        #expect(frameBytes.readableBytes == 0)
+        guard case .known(.headers(let headers)) = frame else {
+            Issue.record("Expected a HEADERS frame, got \(String(describing: frame))")
+            return
+        }
+        let encoder = StaticQPACKEncoder()
+        let expectedFieldSection = ByteBuffer(
+            initialCapacity: encoder.maxEncodedLength(of: self.testRequestHeaderFields)
+        ) {
+            encoder.encode(
+                headers: self.testRequestHeaderFields,
+                into: &$0,
+                preferHuffmanEncoding: preferHuffmanEncoding
+            )
+        }
+        #expect(headers.fieldSection == expectedFieldSection)
     }
 
     /// Write a frame which would result in a connection error.
     @available(anyAppleOS 27, *)
     @Test func writeConnectionError() throws {
         let handler = HTTP3StreamHandler(
-            stateMachine: .init(streamType: .request, incoming: false, preferHuffmanEncoding: false),
-            streamID: 5,
-            streamType: .request,
+            stateMachine: .init(streamType: .control, incoming: false),
+            streamID: 3,
+            streamType: .control,
             qpackCoder: makeTestQPACKCoder(),
+            preferHuffmanEncoding: false,
             delegate: TestDelegate(),
             logger: self.logger
         )
@@ -453,12 +549,13 @@ struct NIOHTTP3StreamHandlerTests {
 
         let channel = EmbeddedChannel(handlers: [handler, errorRecorder], loop: eventLoop)
 
-        // write out a settings frame. This is invalid, because this is a request stream
+        // Write a settings frame, then a data frame. This is invalid, because this is a control stream
+        try channel.writeOutbound(HTTP3Frame.settings(.init()))
         expectH3Error(code: .unexpectedFrame, h3ErrorCode: .frameUnexpected) {
-            try channel.writeOutbound(HTTP3Frame.settings(.init()))
+            try channel.writeOutbound(HTTP3Frame.data(.init()))
         }
         expectH3Error(code: .unexpectedFrame, h3ErrorCode: .frameUnexpected) {
-            let thrownError = try errorPromise.futureResult.wait()
+            let thrownError = try errorPromise.futureResult.completedValue()
             throw thrownError
         }
     }
@@ -469,10 +566,11 @@ struct NIOHTTP3StreamHandlerTests {
         let eventLoop = EmbeddedEventLoop()
         let sawEOF = eventLoop.makePromise(of: Bool.self)
         let handler = HTTP3StreamHandler(
-            stateMachine: .init(streamType: .request, incoming: false, preferHuffmanEncoding: false),
+            stateMachine: .init(streamType: .request, incoming: false),
             streamID: 5,
             streamType: .request,
             qpackCoder: makeTestQPACKCoder(),
+            preferHuffmanEncoding: false,
             delegate: TestDelegate(
                 onStreamClosed: { eof, _, _ in sawEOF.succeed(eof) }
             ),
@@ -499,10 +597,11 @@ struct NIOHTTP3StreamHandlerTests {
         let eventLoop = EmbeddedEventLoop()
         let connectionErrorPromise = eventLoop.makePromise(of: HTTP3Error.self)
         let handler = HTTP3StreamHandler(
-            stateMachine: .init(streamType: .control, incoming: false, preferHuffmanEncoding: false),
+            stateMachine: .init(streamType: .control, incoming: false),
             streamID: 5,
             streamType: .control,
             qpackCoder: makeTestQPACKCoder(),
+            preferHuffmanEncoding: false,
             delegate: TestDelegate(
                 onConnectionError: { connectionErrorPromise.succeed($0) }
             ),
@@ -530,10 +629,11 @@ struct NIOHTTP3StreamHandlerTests {
         // The bool is true if the close was clean, ie we saw EOF
         let streamClosedPromise = eventLoop.makePromise(of: Bool.self)
         let handler = HTTP3StreamHandler(
-            stateMachine: .init(streamType: .control, incoming: false, preferHuffmanEncoding: false),
+            stateMachine: .init(streamType: .control, incoming: false),
             streamID: 5,
             streamType: .control,
             qpackCoder: makeTestQPACKCoder(),
+            preferHuffmanEncoding: false,
             delegate: TestDelegate(
                 onStreamClosed: { eof, _, _ in streamClosedPromise.succeed(eof) },
             ),
@@ -551,10 +651,11 @@ struct NIOHTTP3StreamHandlerTests {
         // The bool is true if the close was clean, ie we saw EOF
         let streamClosedPromise = eventLoop.makePromise(of: Bool.self)
         let handler = HTTP3StreamHandler(
-            stateMachine: .init(streamType: .control, incoming: false, preferHuffmanEncoding: false),
+            stateMachine: .init(streamType: .control, incoming: false),
             streamID: 5,
             streamType: .control,
             qpackCoder: makeTestQPACKCoder(),
+            preferHuffmanEncoding: false,
             delegate: TestDelegate(
                 onStreamClosed: { eof, _, _ in streamClosedPromise.succeed(eof) },
             ),
@@ -574,10 +675,11 @@ struct NIOHTTP3StreamHandlerTests {
         // The bool is true if the close was clean, ie we saw EOF
         let streamClosedPromise = eventLoop.makePromise(of: Bool.self)
         let handler = HTTP3StreamHandler(
-            stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
+            stateMachine: .init(streamType: .request, incoming: true),
             streamID: 5,
             streamType: .request,
             qpackCoder: makeTestQPACKCoder(),
+            preferHuffmanEncoding: false,
             delegate: TestDelegate(
                 onStreamClosed: { eof, _, _ in streamClosedPromise.succeed(eof) },
             ),
@@ -625,10 +727,11 @@ struct NIOHTTP3StreamHandlerTests {
         // The bool is true if the close was clean, ie we saw EOF
         let streamClosedPromise = eventLoop.makePromise(of: Bool.self)
         let handler = HTTP3StreamHandler(
-            stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
+            stateMachine: .init(streamType: .request, incoming: true),
             streamID: 5,
             streamType: .request,
             qpackCoder: makeTestQPACKCoder(),
+            preferHuffmanEncoding: false,
             delegate: TestDelegate(
                 onStreamClosed: { eof, _, _ in streamClosedPromise.succeed(eof) },
             ),
@@ -691,10 +794,11 @@ struct NIOHTTP3StreamHandlerTests {
         let eventLoop = EmbeddedEventLoop()
 
         let handler = HTTP3StreamHandler(
-            stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
+            stateMachine: .init(streamType: .request, incoming: true),
             streamID: 5,
             streamType: .request,
             qpackCoder: makeTestQPACKCoder(),
+            preferHuffmanEncoding: false,
             delegate: TestDelegate(
                 onStreamClosed: { _, _, _ in },
             ),
@@ -724,10 +828,11 @@ struct NIOHTTP3StreamHandlerTests {
         let eventLoop = EmbeddedEventLoop()
 
         let handler = HTTP3StreamHandler(
-            stateMachine: .init(streamType: .request, incoming: true, preferHuffmanEncoding: false),
+            stateMachine: .init(streamType: .request, incoming: true),
             streamID: 5,
             streamType: .request,
             qpackCoder: makeTestQPACKCoder(),
+            preferHuffmanEncoding: false,
             delegate: TestDelegate(
                 onStreamClosed: { _, _, _ in },
             ),
@@ -774,10 +879,11 @@ struct NIOHTTP3StreamHandlerTests {
         let eventLoop = EmbeddedEventLoop()
 
         let handler = HTTP3StreamHandler(
-            stateMachine: .init(streamType: .request, incoming: false, preferHuffmanEncoding: false),
+            stateMachine: .init(streamType: .request, incoming: false),
             streamID: 5,
             streamType: .request,
             qpackCoder: makeTestQPACKCoder(),
+            preferHuffmanEncoding: false,
             delegate: TestDelegate(
                 onStreamClosed: { _, _, _ in },
             ),

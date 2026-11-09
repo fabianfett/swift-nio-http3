@@ -343,129 +343,6 @@ public struct HTTP3StreamStateMachine: ~Copyable {
         }
     }
 
-    /// This state machine handles the writing side of the stream only.
-    /// You call `write` to give it a full frame (not qpack encoded).
-    /// The resulting action will either give bytes to write out, or ask to run something through qpack.
-    /// You must call writeHeadersFrame to have that encoded BEFORE trying to write any different frame.
-    struct WriteState: ~Copyable {
-        private enum State: ~Copyable {
-            /// Nothing special is happening on the write side.
-            case idle(Idle)
-
-            /// We have tried to write a header. We need the result of encoding these fields before we can proceed.
-            case waitingForEncode(WaitingForEncode)
-
-            struct Idle: ~Copyable {
-                var preferHuffmanEncoding: Bool
-            }
-
-            struct WaitingForEncode {
-                var preferHuffmanEncoding: Bool
-
-                init(idleState: consuming Idle) {
-                    self.preferHuffmanEncoding = idleState.preferHuffmanEncoding
-                }
-            }
-        }
-
-        private let state: State
-
-        init(preferHuffmanEncoding: Bool) {
-            self.init(state: .idle(.init(preferHuffmanEncoding: preferHuffmanEncoding)))
-        }
-
-        private init(state: consuming State) {
-            self.state = state
-        }
-
-        enum WriteAction {
-            /// The frame's bytes were appended to the provided buffer.
-            case wroteBytes
-            /// We need this header to be encoder.
-            case encodeHeaders([HTTPField])
-        }
-
-        /// Write a frame out by appending its encoded bytes to `buffer`.
-        mutating func write(frame: HTTP3Frame, into buffer: inout ByteBuffer) -> WriteAction {
-            switch consume self.state {
-            case .idle(let idleState):
-                switch frame {
-                case .headers(let headers):
-                    self = .init(state: .waitingForEncode(.init(idleState: idleState)))
-                    return .encodeHeaders(headers.fields)
-                case .pushPromise:
-                    // This cannot be reached. The validator currently forbids writing push promises at all
-                    // For clients, that is correct
-                    // For servers, it's because we haven't implemented push yet. It would be wrong
-                    // for a server using this http/3 implementation to try to write a push promise frame because we don't
-                    // expose push streams or the max push id yet. Therefore we forbid writing them in the validator.
-                    // So it won't get this far.
-                    fatalError("Tried to write a push promise, which is not supported")
-                case .data(let data):
-                    let payloadLength = data.payload.readableBytes
-                    buffer.writeWithOutputRawSpan(
-                        minimumWritableBytes: HTTP3EncodedLength.dataFrameHeader(payloadLength: payloadLength)
-                    ) {
-                        $0.appendHTTP3DataFrameHeader(payloadLength: payloadLength)
-                    }
-                    buffer.writeImmutableBuffer(data.payload)
-                case .settings(let settings):
-                    buffer.writeWithOutputRawSpan(
-                        minimumWritableBytes: HTTP3EncodedLength.settingsFrame(settings.settings)
-                    ) {
-                        $0.appendHTTP3SettingsFrame(settings.settings)
-                    }
-                case .goaway(let goaway):
-                    buffer.writeWithOutputRawSpan(minimumWritableBytes: HTTP3EncodedLength.goawayFrame(goaway.id)) {
-                        $0.appendHTTP3GoawayFrame(goaway.id)
-                    }
-                case .maxPushID(let maxPushID):
-                    buffer.writeWithOutputRawSpan(
-                        minimumWritableBytes: HTTP3EncodedLength.maxPushIDFrame(maxPushID.id)
-                    ) {
-                        $0.appendHTTP3MaxPushIDFrame(maxPushID.id)
-                    }
-                case .cancelPush(let cancelPush):
-                    buffer.writeWithOutputRawSpan(
-                        minimumWritableBytes: HTTP3EncodedLength.cancelPushFrame(cancelPush.pushID)
-                    ) {
-                        $0.appendHTTP3CancelPushFrame(cancelPush.pushID)
-                    }
-                }
-                self = .init(state: .idle(idleState))
-                return .wroteBytes
-            case .waitingForEncode:
-                fatalError("Cannot call write whilst waiting for a QPACK encode result")
-            }
-        }
-
-        enum HeaderEncodeResultAction {
-            /// The header's bytes were appended to the provided buffer.
-            case wroteBytes
-        }
-
-        mutating func writeHeadersFrame(
-            maxPayloadLength: Int,
-            into buffer: inout ByteBuffer,
-            encodePayload: (inout OutputRawSpan, _ preferHuffmanEncoding: Bool) -> Void
-        ) -> HeaderEncodeResultAction {
-            switch consume self.state {
-            case .idle:
-                fatalError("Unexpected header encode")
-            case .waitingForEncode(let waitingState):
-                buffer.writeWithOutputRawSpan(
-                    minimumWritableBytes: HTTP3EncodedLength.headersFrame(maxPayloadLength: maxPayloadLength)
-                ) { output in
-                    output.appendHTTP3HeadersFrame(maxPayloadLength: maxPayloadLength) { payload in
-                        encodePayload(&payload, waitingState.preferHuffmanEncoding)
-                    }
-                }
-                self = .init(state: .idle(.init(preferHuffmanEncoding: waitingState.preferHuffmanEncoding)))
-                return .wroteBytes
-            }
-        }
-    }
-
     enum State: ~Copyable {
         /// We are currently not doing anything special.
         case idle(Idle)
@@ -479,7 +356,6 @@ public struct HTTP3StreamStateMachine: ~Copyable {
         struct Idle: ~Copyable {
             var validator: HTTP3FrameValidator
             var readState: ReadState
-            var writeState: WriteState
         }
 
         /// The state contained in ``State/previousError(_:)``.
@@ -495,16 +371,11 @@ public struct HTTP3StreamStateMachine: ~Copyable {
     private let state: State
 
     @_spi(PackageInternal)
-    public init(
-        streamType: HTTP3StreamType.Framed,
-        incoming: Bool,
-        preferHuffmanEncoding: Bool
-    ) {
+    public init(streamType: HTTP3StreamType.Framed, incoming: Bool) {
         let frameDecoder = HTTP3FrameDecoderStateMachine()
         let frameValidator = HTTP3FrameValidator(streamType: streamType, incoming: incoming)
         let readState = ReadState(decoder: frameDecoder)
-        let writeState = WriteState(preferHuffmanEncoding: preferHuffmanEncoding)
-        self.init(state: .idle(.init(validator: frameValidator, readState: readState, writeState: writeState)))
+        self.init(state: .idle(.init(validator: frameValidator, readState: readState)))
     }
 
     private init(state: consuming State) {
@@ -513,10 +384,8 @@ public struct HTTP3StreamStateMachine: ~Copyable {
 
     @_spi(PackageInternal)
     public enum WriteFrameAction {
-        /// The frame's bytes were appended to the buffer you provided.
-        case wroteBytes
-        /// You should QPACK encode the given headers through ``HTTP3StreamStateMachine/writeHeadersFrame(maxPayloadLength:into:encodePayload:)``.
-        case encodeHeaders([HTTPField])
+        /// The frame may be written: encode it and write it out.
+        case write
         /// The frame can't be written, because doing so would be a stream error.
         case wouldBeStreamError(HTTP3Error)
         /// The frame can't be written, because doing so would be a connection error.
@@ -527,9 +396,12 @@ public struct HTTP3StreamStateMachine: ~Copyable {
         case previousError
     }
 
-    /// Write out a frame by appending its encoded bytes to `buffer`.
+    /// Tell the machine that `frame` is about to be written, and ask whether it may be.
+    ///
+    /// The machine doesn't encode the frame: on ``WriteFrameAction/write`` the caller does, in the same call, before
+    /// it tells the machine about anything else.
     @_spi(PackageInternal)
-    public mutating func writeFrame(frame: HTTP3Frame, into buffer: inout ByteBuffer) -> WriteFrameAction {
+    public mutating func willWriteFrame(_ frame: HTTP3Frame) -> WriteFrameAction {
         switch self.state {
         case .idle(var idleState):
             guard idleState.readState.checkCanWrite() else {
@@ -538,16 +410,9 @@ public struct HTTP3StreamStateMachine: ~Copyable {
             }
             let validationResult = idleState.validator.processOutboundFrame(frame)
             switch validationResult {
-            case .forwardFrame(let validatedFrame):
-                let writeAction = idleState.writeState.write(frame: validatedFrame, into: &buffer)
-                switch writeAction {
-                case .wroteBytes:
-                    self = .init(state: .idle(idleState))
-                    return .wroteBytes
-                case .encodeHeaders(let fields):
-                    self = .init(state: .idle(idleState))
-                    return .encodeHeaders(fields)
-                }
+            case .forwardFrame:
+                self = .init(state: .idle(idleState))
+                return .write
             case .emitStreamError(let error):
                 self = .init(state: .previousError(.init(error: error, seenEOF: idleState.readState.hasSeenEOF)))
                 return .wouldBeStreamError(error)
@@ -564,55 +429,6 @@ public struct HTTP3StreamStateMachine: ~Copyable {
         case .finished:
             self = .init(state: .finished)
             return .alreadyClosed
-        }
-    }
-
-    @_spi(PackageInternal)
-    public enum HeaderEncodeResultAction {
-        /// The header's bytes were appended to the buffer you provided.
-        case wroteBytes
-        /// This header can't be encoded because the stream is already in an error state.
-        case previousError(HTTP3Error)
-        /// You should fail the current write because the stream is already closed
-        case alreadyClosed
-    }
-
-    /// Write the HEADERS frame asked for by ``WriteFrameAction/encodeHeaders(_:)``, by appending its bytes to `buffer`.
-    ///
-    /// - Parameters:
-    ///   - maxPayloadLength: The largest number of bytes `encodePayload` appends.
-    ///   - buffer: The buffer to append the frame to.
-    ///   - encodePayload: QPACK encodes the headers into the span, which has room for `maxPayloadLength` bytes, and
-    ///     is told whether to prefer Huffman encoding. It isn't called if the frame can't be written.
-    /// - Returns: Whether the frame was written.
-    @_spi(PackageInternal)
-    public mutating func writeHeadersFrame(
-        maxPayloadLength: Int,
-        into buffer: inout ByteBuffer,
-        encodePayload: (inout OutputRawSpan, _ preferHuffmanEncoding: Bool) -> Void
-    ) -> HeaderEncodeResultAction {
-        switch self.state {
-        case .idle(var idleState):
-            let writeAction = idleState.writeState.writeHeadersFrame(
-                maxPayloadLength: maxPayloadLength,
-                into: &buffer,
-                encodePayload: encodePayload
-            )
-            self = .init(state: .idle(idleState))
-            switch writeAction {
-            case .wroteBytes:
-                return .wroteBytes
-            }
-        case .finished:
-            // We shouldn't be asked to write the headers on a finished stream.
-            // This can only really happen if we shut down the stream during a write, before doing the qpack encode.
-            // But if we do, don't encode them at all, nobody is waiting for them now.
-            self = .init(state: .finished)
-            return .alreadyClosed
-        case .previousError(let errorState):
-            let error = errorState.error
-            self = .init(state: .previousError(errorState))
-            return .previousError(error)
         }
     }
 
