@@ -73,5 +73,6 @@ let benchmarks: @Sendable () -> Void = {
         }
     }
 
-    qpackCoderBenchmarks()
+    qpackEncodeBenchmarks()
+    qpackDecodeBenchmarks()
 }

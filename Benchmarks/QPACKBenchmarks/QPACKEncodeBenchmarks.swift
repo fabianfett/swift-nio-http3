@@ -119,7 +119,7 @@ private func coderEncodeBenchmark(_ name: String, fields: [HTTPField], dynamic: 
 }
 
 /// Encodes field sections end to end through the ``QPACKCoder``, from `[HTTPField]` to bytes.
-func qpackCoderBenchmarks() {
+func qpackEncodeBenchmarks() {
     coderEncodeBenchmark("QPACKCoderEncode_Static_BrowserGET", fields: requestHeaders, dynamic: false)
     coderEncodeBenchmark("QPACKCoderEncode_Static_Response", fields: responseHeaders, dynamic: false)
     coderEncodeBenchmark("QPACKCoderEncode_Dynamic_BrowserGET", fields: requestHeaders, dynamic: true)
