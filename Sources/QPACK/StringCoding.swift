@@ -33,13 +33,25 @@ extension ByteBuffer {
         at: Int,
         withPrefix prefix: Int
     ) throws(IntegerReadingError) -> Decoded<String>? {
+        try self.readableBytesSpan.getQPACKEncodedString(at: at &- self.readerIndex, withPrefix: prefix)
+    }
+}
+
+extension RawSpan {
+    /// Get one QPACK encoded string, which starts `offset` bytes into the span.
+    @available(anyAppleOS 27, *)
+    func getQPACKEncodedString(
+        at offset: Int,
+        withPrefix prefix: Int
+    ) throws(IntegerReadingError) -> Decoded<String>? {
         /// RFC 9204 4.1.2: The prefix size, N, can have a value between 2 and 8, inclusive. The remainder of the string literal is unmodified.
         precondition(prefix >= 2)
         precondition(prefix <= 8)
         // peek to read the encoding bit
-        guard let initialByte: UInt8 = self.getInteger(at: at) else {
+        guard offset >= 0, offset < self.byteCount else {
             return nil
         }
+        let initialByte = self.qpackByte(at: offset)
         // We are using huffman encoding if the first bit after the prefix is 1
         // E.g. is prefix is 4, then the 5th bit represents huffman coding
         // so in that case we would & 0b00001000
@@ -47,24 +59,27 @@ extension ByteBuffer {
         let huffmanEncoded = initialByte & huffmanMask == huffmanMask
 
         // read the length; the prefix is now one bit less (one-bit encoding flag above)
-        guard let lengthInt = try self.getQPACKPrefixedInteger(as: Int.self, at: at, withPrefix: prefix - 1) else {
+        guard let lengthInt = try self.getQPACKPrefixedInteger(as: Int.self, at: offset, withPrefix: prefix - 1) else {
+            return nil
+        }
+        // The length comes off the wire, so check it against the bytes we have before forming a range.
+        let start = offset &+ lengthInt.bytesRead
+        guard lengthInt.value <= self.byteCount &- start else {
             return nil
         }
 
+        let string: String
         if huffmanEncoded {
-            guard
-                let string = self.getHuffmanEncodedString(
-                    at: at + lengthInt.bytesRead,
-                    length: lengthInt.value
-                )
-            else { return nil }
-            return Decoded<String>(value: string, bytesRead: lengthInt.bytesRead + lengthInt.value)
-        } else {
-            guard let string = self.getString(at: at + lengthInt.bytesRead, length: lengthInt.value) else {
+            guard let decoded = self.getHuffmanEncodedString(at: start, length: lengthInt.value) else {
                 return nil
             }
-            return Decoded<String>(value: string, bytesRead: lengthInt.bytesRead + lengthInt.value)
+            string = decoded
+        } else {
+            string = self.extracting(start..<(start &+ lengthInt.value)).withUnsafeBytes { bytes in
+                String(decoding: bytes, as: UTF8.self)
+            }
         }
+        return Decoded<String>(value: string, bytesRead: lengthInt.bytesRead &+ lengthInt.value)
     }
 }
 
